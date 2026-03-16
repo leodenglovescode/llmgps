@@ -5,3 +5,10 @@ node_modules
 npm-debug.log*
 Dockerfile
 README.md
+.env
+.llmgps-data.json
+.llmgps-data.json.tmp
+.llmgps-data.sqlite
+.llmgps-data.sqlite-shm
+.llmgps-data.sqlite-wal
+.llmgps-data.key

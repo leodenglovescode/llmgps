@@ -31,7 +31,13 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
+.env
+.llmgps-data.json
+.llmgps-data.json.tmp
+.llmgps-data.sqlite
+.llmgps-data.sqlite-shm
+.llmgps-data.sqlite-wal
+.llmgps-data.key
 
 # vercel
 .vercel

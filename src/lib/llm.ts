@@ -4,7 +4,8 @@ export type ProviderId =
   | "gemini"
   | "openrouter"
   | "deepseek"
-  | "xai";
+  | "xai"
+  | "ollama";
 
 export type ChatRole = "user" | "assistant";
 
@@ -25,11 +26,12 @@ export type ModelOption = {
 export type ProviderPreset = {
   id: ProviderId;
   name: string;
+  authStrategy: "api-key" | "none";
   apiKeyLabel: string;
   apiKeyPlaceholder: string;
   docsUrl: string;
   description: string;
-  requestShape: "openai-compatible" | "anthropic" | "gemini";
+  requestShape: "openai-compatible" | "anthropic" | "gemini" | "ollama";
   models: ModelOption[];
 };
 
@@ -49,6 +51,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "openai",
     name: "OpenAI",
+    authStrategy: "api-key",
     apiKeyLabel: "OpenAI API Key",
     apiKeyPlaceholder: "sk-...",
     docsUrl: "https://platform.openai.com/api-keys",
@@ -76,6 +79,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "anthropic",
     name: "Anthropic",
+    authStrategy: "api-key",
     apiKeyLabel: "Anthropic API Key",
     apiKeyPlaceholder: "sk-ant-...",
     docsUrl: "https://console.anthropic.com/settings/keys",
@@ -103,6 +107,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "gemini",
     name: "Google Gemini",
+    authStrategy: "api-key",
     apiKeyLabel: "Gemini API Key",
     apiKeyPlaceholder: "AIza...",
     docsUrl: "https://aistudio.google.com/app/apikey",
@@ -130,6 +135,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "openrouter",
     name: "OpenRouter",
+    authStrategy: "api-key",
     apiKeyLabel: "OpenRouter API Key",
     apiKeyPlaceholder: "sk-or-...",
     docsUrl: "https://openrouter.ai/keys",
@@ -157,6 +163,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "deepseek",
     name: "DeepSeek",
+    authStrategy: "api-key",
     apiKeyLabel: "DeepSeek API Key",
     apiKeyPlaceholder: "sk-...",
     docsUrl: "https://platform.deepseek.com/api_keys",
@@ -184,6 +191,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   {
     id: "xai",
     name: "xAI",
+    authStrategy: "api-key",
     apiKeyLabel: "xAI API Key",
     apiKeyPlaceholder: "xai-...",
     docsUrl: "https://console.x.ai/",
@@ -205,6 +213,42 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         label: "Grok Beta",
         description: "Fallback alias if your account exposes older presets.",
         speed: "Fast",
+      },
+    ],
+  },
+  {
+    id: "ollama",
+    name: "Ollama",
+    authStrategy: "none",
+    apiKeyLabel: "",
+    apiKeyPlaceholder: "",
+    docsUrl: "https://ollama.com/",
+    description: "Local models served through the Ollama chat API.",
+    requestShape: "ollama",
+    models: [
+      {
+        id: "ollama:llama3.2",
+        providerId: "ollama",
+        modelId: "llama3.2",
+        label: "Ollama · Llama 3.2",
+        description: "Common local default for quick general chat.",
+        speed: "Fast",
+      },
+      {
+        id: "ollama:qwen2.5",
+        providerId: "ollama",
+        modelId: "qwen2.5",
+        label: "Ollama · Qwen 2.5",
+        description: "Balanced local model family with broad availability.",
+        speed: "Balanced",
+      },
+      {
+        id: "ollama:deepseek-r1",
+        providerId: "ollama",
+        modelId: "deepseek-r1",
+        label: "Ollama · DeepSeek R1",
+        description: "Heavier local reasoning model when installed.",
+        speed: "Deep",
       },
     ],
   },

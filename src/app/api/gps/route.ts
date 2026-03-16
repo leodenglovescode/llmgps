@@ -1,14 +1,30 @@
-import { NextResponse } from "next/server";
-import { GpsError, runGpsWorkflowStreaming, type GpsRequestPayload } from "@/lib/gps";
+import { NextRequest, NextResponse } from "next/server";
 
-export async function POST(request: Request) {
+import { GpsError, runGpsWorkflowStreaming, type ClientGpsRequestPayload } from "@/lib/gps";
+import { getAuthenticatedUsername } from "@/lib/server-auth";
+import { getExecutionSettings } from "@/lib/server-state";
+
+export async function POST(request: NextRequest) {
   try {
-    const payload = (await request.json()) as GpsRequestPayload;
+    const username = await getAuthenticatedUsername(request);
+
+    if (!username) {
+      return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+    }
+
+    const payload = (await request.json()) as ClientGpsRequestPayload;
+    const executionSettings = await getExecutionSettings();
+    const executionPayload = {
+      ...payload,
+      apiKeys: executionSettings.apiKeys,
+      ollamaBaseUrl: executionSettings.ollamaBaseUrl,
+      proxyUrl: executionSettings.proxyUrl,
+    };
 
     const stream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const chunk of runGpsWorkflowStreaming(payload)) {
+          for await (const chunk of runGpsWorkflowStreaming(executionPayload)) {
             controller.enqueue(new TextEncoder().encode(JSON.stringify(chunk) + '\n'));
           }
           controller.close();

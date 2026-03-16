@@ -10,6 +10,8 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
 import nodeFetch from "node-fetch";
 
+const PROVIDER_REQUEST_TIMEOUT_MS = 120_000;
+
 async function proxyFetch(url: string, options: globalThis.RequestInit, proxyUrl?: string) {
   if (!proxyUrl) {
     return fetch(url, options);
@@ -25,13 +27,17 @@ async function proxyFetch(url: string, options: globalThis.RequestInit, proxyUrl
 
 export type ApiKeyMap = Partial<Record<ModelSelection["providerId"], string>>;
 
-export type GpsRequestPayload = {
-  apiKeys: ApiKeyMap;
+export type ClientGpsRequestPayload = {
   gpsMode: boolean;
   debateMode?: boolean;
   messages: ChatMessage[];
   responderModels: ModelSelection[];
   synthesizerModel?: ModelSelection | null;
+};
+
+export type GpsExecutionPayload = ClientGpsRequestPayload & {
+  apiKeys: ApiKeyMap;
+  ollamaBaseUrl?: string;
   proxyUrl?: string;
 };
 
@@ -132,13 +138,61 @@ function getOpenAICompatibleBaseUrl(providerId: ModelSelection["providerId"]) {
   }
 }
 
+function getRequiredProviderSecret(model: ModelSelection, apiKeys: ApiKeyMap) {
+  if (model.providerId === "ollama") {
+    return null;
+  }
+
+  const apiKey = apiKeys[model.providerId]?.trim();
+
+  if (!apiKey) {
+    throw new GpsError(`Missing API key for ${model.providerId}.`, 400);
+  }
+
+  return apiKey;
+}
+
 async function parseError(response: Response) {
   try {
-    const json = (await response.json()) as { error?: { message?: string } };
-    return json.error?.message || response.statusText;
+    const raw = await response.text();
+
+    if (!raw.trim()) {
+      return response.statusText;
+    }
+
+    try {
+      const json = JSON.parse(raw) as { error?: { message?: string }; message?: string };
+      return json.error?.message || json.message || raw || response.statusText;
+    } catch {
+      return raw;
+    }
   } catch {
     return response.statusText;
   }
+}
+
+function normalizeProviderError(error: unknown) {
+  if (error instanceof GpsError) {
+    return error;
+  }
+
+  if (error instanceof DOMException && error.name === "TimeoutError") {
+    return new GpsError(
+      `Provider request timed out after ${Math.round(PROVIDER_REQUEST_TIMEOUT_MS / 1000)}s.`,
+      504,
+    );
+  }
+
+  if (error instanceof Error && error.name === "AbortError") {
+    return new GpsError(
+      `Provider request timed out after ${Math.round(PROVIDER_REQUEST_TIMEOUT_MS / 1000)}s.`,
+      504,
+    );
+  }
+
+  return error instanceof Error
+    ? new GpsError(error.message, 500)
+    : new GpsError("The provider request failed.", 500);
 }
 
 async function sendOpenAICompatibleMessage(
@@ -147,46 +201,50 @@ async function sendOpenAICompatibleMessage(
   messages: ChatMessage[],
   proxyUrl?: string,
 ) {
-  const response = await proxyFetch(getOpenAICompatibleBaseUrl(model.providerId), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      ...(model.providerId === "openrouter"
-        ? {
-            "HTTP-Referer": "https://llmgps.local",
-            "X-Title": "llmgps",
-          }
-        : {}),
-    },
-    body: JSON.stringify({
-      model: model.modelId,
-      messages,
-      temperature: 0.6,
-    }),
-    signal: AbortSignal.timeout(60_000),
-  }, proxyUrl);
+  try {
+    const response = await proxyFetch(getOpenAICompatibleBaseUrl(model.providerId), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...(model.providerId === "openrouter"
+          ? {
+              "HTTP-Referer": "https://llmgps.local",
+              "X-Title": "llmgps",
+            }
+          : {}),
+      },
+      body: JSON.stringify({
+        model: model.modelId,
+        messages,
+        temperature: 0.6,
+      }),
+      signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+    }, proxyUrl);
 
-  if (!response.ok) {
-    throw new GpsError(await parseError(response), response.status);
+    if (!response.ok) {
+      throw new GpsError(await parseError(response), response.status);
+    }
+
+    const payload = (await response.json()) as OpenAICompatibleResponse;
+    const content = payload.choices?.[0]?.message?.content;
+
+    if (typeof content === "string" && content.trim()) {
+      return content.trim();
+    }
+
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => part.text)
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+
+    throw new GpsError(payload.error?.message || "The provider returned an empty response.", 502);
+  } catch (error) {
+    throw normalizeProviderError(error);
   }
-
-  const payload = (await response.json()) as OpenAICompatibleResponse;
-  const content = payload.choices?.[0]?.message?.content;
-
-  if (typeof content === "string" && content.trim()) {
-    return content.trim();
-  }
-
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => part.text)
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-  }
-
-  throw new GpsError(payload.error?.message || "The provider returned an empty response.", 502);
 }
 
 async function sendAnthropicMessage(
@@ -195,42 +253,46 @@ async function sendAnthropicMessage(
   messages: ChatMessage[],
   proxyUrl?: string,
 ) {
-  const response = await proxyFetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: model.modelId,
-      max_tokens: 1200,
-      messages: messages.map((message) => ({
-        role: message.role,
-        content: message.content,
-      })),
-    }),
-    signal: AbortSignal.timeout(60_000),
-  }, proxyUrl);
+  try {
+    const response = await proxyFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: model.modelId,
+        max_tokens: 1200,
+        messages: messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+      }),
+      signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+    }, proxyUrl);
 
-  if (!response.ok) {
-    throw new GpsError(await parseError(response), response.status);
+    if (!response.ok) {
+      throw new GpsError(await parseError(response), response.status);
+    }
+
+    const payload = (await response.json()) as AnthropicResponse;
+    const content =
+      payload.content
+        ?.filter((entry) => entry.type === "text")
+        .map((entry) => entry.text)
+        .filter(Boolean)
+        .join("\n")
+        .trim() || "";
+
+    if (!content) {
+      throw new GpsError(payload.error?.message || "Anthropic returned an empty response.", 502);
+    }
+
+    return content;
+  } catch (error) {
+    throw normalizeProviderError(error);
   }
-
-  const payload = (await response.json()) as AnthropicResponse;
-  const content =
-    payload.content
-      ?.filter((entry) => entry.type === "text")
-      .map((entry) => entry.text)
-      .filter(Boolean)
-      .join("\n")
-      .trim() || "";
-
-  if (!content) {
-    throw new GpsError(payload.error?.message || "Anthropic returned an empty response.", 502);
-  }
-
-  return content;
 }
 
 async function sendGeminiMessage(
@@ -239,50 +301,106 @@ async function sendGeminiMessage(
   messages: ChatMessage[],
   proxyUrl?: string,
 ) {
-  const response = await proxyFetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model.modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        contents: messages.map((message) => ({
-          role: message.role === "assistant" ? "model" : "user",
-          parts: [{ text: message.content }],
-        })),
-        generationConfig: {
-          temperature: 0.6,
+  try {
+    const response = await proxyFetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model.modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      }),
-      signal: AbortSignal.timeout(60_000),
-    },
-    proxyUrl
-  );
+        body: JSON.stringify({
+          contents: messages.map((message) => ({
+            role: message.role === "assistant" ? "model" : "user",
+            parts: [{ text: message.content }],
+          })),
+          generationConfig: {
+            temperature: 0.6,
+          },
+        }),
+        signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+      },
+      proxyUrl
+    );
 
-  if (!response.ok) {
-    throw new GpsError(await parseError(response), response.status);
+    if (!response.ok) {
+      throw new GpsError(await parseError(response), response.status);
+    }
+
+    const payload = (await response.json()) as GeminiResponse;
+    const content =
+      payload.candidates?.[0]?.content?.parts
+        ?.map((part) => part.text)
+        .filter(Boolean)
+        .join("\n")
+        .trim() || "";
+
+    if (!content) {
+      throw new GpsError(payload.error?.message || "Gemini returned an empty response.", 502);
+    }
+
+    return content;
+  } catch (error) {
+    throw normalizeProviderError(error);
   }
+}
 
-  const payload = (await response.json()) as GeminiResponse;
-  const content =
-    payload.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text)
-      .filter(Boolean)
-      .join("\n")
-      .trim() || "";
+async function sendOllamaMessage(
+  model: ModelSelection,
+  messages: ChatMessage[],
+  ollamaBaseUrl?: string,
+  proxyUrl?: string,
+) {
+  try {
+    if (!ollamaBaseUrl?.trim()) {
+      throw new GpsError("Ollama is not enabled in Settings.", 400);
+    }
 
-  if (!content) {
-    throw new GpsError(payload.error?.message || "Gemini returned an empty response.", 502);
+    const normalizedBaseUrl = ollamaBaseUrl.replace(/\/$/, "");
+    const response = await proxyFetch(
+      `${normalizedBaseUrl}/api/chat`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: model.modelId,
+          messages,
+          stream: false,
+        }),
+        signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+      },
+      proxyUrl,
+    );
+
+    if (!response.ok) {
+      throw new GpsError(await parseError(response), response.status);
+    }
+
+    const payload = (await response.json()) as {
+      error?: string;
+      message?: {
+        content?: string;
+      };
+    };
+    const content = payload.message?.content?.trim() || "";
+
+    if (!content) {
+      throw new GpsError(payload.error || "Ollama returned an empty response.", 502);
+    }
+
+    return content;
+  } catch (error) {
+    throw normalizeProviderError(error);
   }
-
-  return content;
 }
 
 async function sendModelMessage(
   model: ModelSelection,
-  apiKey: string,
+  apiKey: string | null,
   messages: ChatMessage[],
+  ollamaBaseUrl?: string,
   proxyUrl?: string,
 ) {
   const provider = getProvider(model.providerId);
@@ -293,11 +411,13 @@ async function sendModelMessage(
 
   switch (provider.requestShape) {
     case "openai-compatible":
-      return sendOpenAICompatibleMessage(model, apiKey, messages, proxyUrl);
+      return sendOpenAICompatibleMessage(model, apiKey || "", messages, proxyUrl);
     case "anthropic":
-      return sendAnthropicMessage(model, apiKey, messages, proxyUrl);
+      return sendAnthropicMessage(model, apiKey || "", messages, proxyUrl);
     case "gemini":
-      return sendGeminiMessage(model, apiKey, messages, proxyUrl);
+      return sendGeminiMessage(model, apiKey || "", messages, proxyUrl);
+    case "ollama":
+      return sendOllamaMessage(model, messages, ollamaBaseUrl, proxyUrl);
     default:
       throw new GpsError(`Unsupported request shape for ${provider.name}.`, 500);
   }
@@ -325,7 +445,7 @@ ${opinionsBlock}
 Return one direct final answer to the user.`;
 }
 
-function ensureValidRequest(payload: GpsRequestPayload) {
+function ensureValidRequest(payload: ClientGpsRequestPayload) {
   if (!Array.isArray(payload.messages) || payload.messages.length === 0) {
     throw new GpsError("At least one message is required.", 400);
   }
@@ -344,7 +464,7 @@ function ensureValidRequest(payload: GpsRequestPayload) {
 }
 
 export async function runGpsWorkflow(
-  payload: GpsRequestPayload,
+  payload: GpsExecutionPayload,
 ): Promise<GpsResponsePayload> {
   ensureValidRequest(payload);
 
@@ -362,13 +482,14 @@ export async function runGpsWorkflow(
   const primaryModel = payload.responderModels[0];
 
   if (!payload.gpsMode && !payload.debateMode) {
-    const apiKey = payload.apiKeys[primaryModel.providerId]?.trim();
-
-    if (!apiKey) {
-      throw new GpsError(`Missing API key for ${primaryModel.providerId}.`, 400);
-    }
-
-    const content = await sendModelMessage(primaryModel, apiKey, cleanMessages, payload.proxyUrl);
+    const apiKey = getRequiredProviderSecret(primaryModel, payload.apiKeys);
+    const content = await sendModelMessage(
+      primaryModel,
+      apiKey,
+      cleanMessages,
+      payload.ollamaBaseUrl,
+      payload.proxyUrl,
+    );
 
     return {
       consensus: content,
@@ -382,13 +503,14 @@ export async function runGpsWorkflow(
   const opinionMessages = buildOpinionMessages(cleanMessages);
   const settled = await Promise.allSettled(
     payload.responderModels.map(async (model) => {
-      const apiKey = payload.apiKeys[model.providerId]?.trim();
-
-      if (!apiKey) {
-        throw new GpsError(`Missing API key for ${model.providerId}.`, 400);
-      }
-
-      const content = await sendModelMessage(model, apiKey, opinionMessages, payload.proxyUrl);
+      const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+      const content = await sendModelMessage(
+        model,
+        apiKey,
+        opinionMessages,
+        payload.ollamaBaseUrl,
+        payload.proxyUrl,
+      );
 
       return {
         ...model,
@@ -427,18 +549,18 @@ export async function runGpsWorkflow(
     throw new GpsError("Choose a synthesizer model before using GPS Mode.", 400);
   }
 
-  const synthesizerApiKey = payload.apiKeys[synthesizerModel.providerId]?.trim();
-
-  if (!synthesizerApiKey) {
-    throw new GpsError(`Missing API key for ${synthesizerModel.providerId}.`, 400);
-  }
-
-  const consensus = await sendModelMessage(synthesizerModel, synthesizerApiKey, [
-    {
-      role: "user",
-      content: buildSynthesisMessage(cleanMessages, opinions),
-    },
-  ]);
+  const synthesizerApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
+  const consensus = await sendModelMessage(
+    synthesizerModel,
+    synthesizerApiKey,
+    [
+      {
+        role: "user",
+        content: buildSynthesisMessage(cleanMessages, opinions),
+      },
+    ],
+    payload.ollamaBaseUrl,
+  );
 
   return {
     consensus,
@@ -456,7 +578,7 @@ export type GpsStreamEvent =
   | { type: 'opinion'; model: string; content: string; phase: 'initial' | 'debate' };
 
 export async function* runGpsWorkflowStreaming(
-  payload: GpsRequestPayload,
+  payload: GpsExecutionPayload,
 ): AsyncGenerator<GpsStreamEvent, void, unknown> {
   ensureValidRequest(payload);
 
@@ -474,15 +596,18 @@ export async function* runGpsWorkflowStreaming(
   const primaryModel = payload.responderModels[0];
 
   if (!payload.gpsMode && !payload.debateMode) {
-    const apiKey = payload.apiKeys[primaryModel.providerId]?.trim();
-    if (!apiKey) {
-      throw new GpsError(`Missing API key for ${primaryModel.providerId}.`, 400);
-    }
+    const apiKey = getRequiredProviderSecret(primaryModel, payload.apiKeys);
 
     yield { type: 'progress', message: `Trying to access ${(primaryModel.label || primaryModel.modelId)} API...` };
     yield { type: 'progress', message: `Sending prompt to ${(primaryModel.label || primaryModel.modelId)}...` };
 
-    const content = await sendModelMessage(primaryModel, apiKey, cleanMessages, payload.proxyUrl);
+    const content = await sendModelMessage(
+      primaryModel,
+      apiKey,
+      cleanMessages,
+      payload.ollamaBaseUrl,
+      payload.proxyUrl,
+    );
     yield {
       type: 'result',
       payload: {
@@ -506,10 +631,14 @@ export async function* runGpsWorkflowStreaming(
   // First Round
   const firstRoundSettled = await Promise.allSettled(
     payload.responderModels.map(async (model) => {
-      const apiKey = payload.apiKeys[model.providerId]?.trim();
-      if (!apiKey) throw new GpsError(`Missing API key for ${model.providerId}.`, 400);
-      
-      const content = await sendModelMessage(model, apiKey, opinionMessages, payload.proxyUrl);
+      const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+      const content = await sendModelMessage(
+        model,
+        apiKey,
+        opinionMessages,
+        payload.ollamaBaseUrl,
+        payload.proxyUrl,
+      );
       return { ...model, content } satisfies ModelOpinion;
     }),
   );
@@ -549,8 +678,7 @@ export async function* runGpsWorkflowStreaming(
 
     const debateRoundSettled = await Promise.allSettled(
       initialOpinions.map(async (model) => {
-        const apiKey = payload.apiKeys[model.providerId]?.trim();
-        if (!apiKey) throw new GpsError(`Missing API key for ${model.providerId}.`, 400);
+        const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
 
         const debateMessages: ChatMessage[] = [
           ...cleanMessages,
@@ -558,7 +686,13 @@ export async function* runGpsWorkflowStreaming(
           { role: 'user', content: debateSystemPrompt }
         ];
 
-        const content = await sendModelMessage(model, apiKey, debateMessages, payload.proxyUrl);
+        const content = await sendModelMessage(
+          model,
+          apiKey,
+          debateMessages,
+          payload.ollamaBaseUrl,
+          payload.proxyUrl,
+        );
         return { ...model, content } satisfies ModelOpinion;
       })
     );
@@ -590,19 +724,21 @@ export async function* runGpsWorkflowStreaming(
     throw new GpsError("Choose a synthesizer model before using GPS Mode.", 400);
   }
 
-  const synthesizerApiKey = payload.apiKeys[synthesizerModel.providerId]?.trim();
-  if (!synthesizerApiKey) {
-    throw new GpsError(`Missing API key for ${synthesizerModel.providerId}.`, 400);
-  }
+  const synthesizerApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
 
   yield { type: 'progress', message: `Synthesizing answers with ${(synthesizerModel.label || synthesizerModel.modelId)}...` };
 
-  const consensus = await sendModelMessage(synthesizerModel, synthesizerApiKey, [
-    {
-      role: "user",
-      content: buildSynthesisMessage(cleanMessages, finalOpinions),
-    },
-  ]);
+  const consensus = await sendModelMessage(
+    synthesizerModel,
+    synthesizerApiKey,
+    [
+      {
+        role: "user",
+        content: buildSynthesisMessage(cleanMessages, finalOpinions),
+      },
+    ],
+    payload.ollamaBaseUrl,
+  );
 
   yield {
     type: 'result',

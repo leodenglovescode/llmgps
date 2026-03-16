@@ -16,11 +16,19 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3000
+ENV LLMGPS_CONTAINERIZED=true
+ENV LLMGPS_DATA_FILE=/data/llmgps-data.sqlite
 
-COPY --from=builder /app/.next ./.next
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/package.json ./package.json
-COPY --from=builder /app/node_modules ./node_modules
+RUN mkdir -p /data && chown -R node:node /app /data
+
+COPY --from=builder --chown=node:node /app/.next ./.next
+COPY --from=builder --chown=node:node /app/public ./public
+COPY --from=builder --chown=node:node /app/package.json ./package.json
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
+
+USER node
+
+VOLUME ["/data"]
 
 EXPOSE 3000
 
