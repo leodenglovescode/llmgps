@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { getAuthenticatedUsername } from "@/lib/server-auth";
+import { logError } from "@/lib/logger";
 import { getAppStatus } from "@/lib/server-state";
 
 type OllamaTagsResponse = {
@@ -41,6 +42,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ models });
   } catch (error) {
+    logError("ollama/tags", "Ollama tags fetch error", error);
     const message = error instanceof Error ? error.message : "Could not reach Ollama.";
     return NextResponse.json({ error: message }, { status: 502 });
   }

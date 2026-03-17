@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { GpsError, runGpsWorkflowStreaming, type ClientGpsRequestPayload } from "@/lib/gps";
+import { logError } from "@/lib/logger";
 import { getAuthenticatedUsername } from "@/lib/server-auth";
 import { getExecutionSettings } from "@/lib/server-state";
 
@@ -19,7 +20,9 @@ export async function POST(request: NextRequest) {
       apiKeys: executionSettings.apiKeys,
       ollamaBaseUrl: executionSettings.ollamaBaseUrl,
       proxyUrl: executionSettings.proxyUrl,
-      webSearchConfig: executionSettings.webSearchConfig,
+      webSearchConfig: executionSettings.webSearchConfig
+        ? { ...executionSettings.webSearchConfig, enabled: payload.webSearchEnabled ?? executionSettings.webSearchConfig.enabled }
+        : undefined,
     };
 
     const stream = new ReadableStream({
@@ -30,7 +33,7 @@ export async function POST(request: NextRequest) {
           }
           controller.close();
         } catch (error: unknown) {
-          console.error(error);
+          logError("gps/stream", "Streaming workflow error", error);
           const errorMessage = error instanceof GpsError 
             ? error.message 
             : error instanceof Error ? error.message : "Something went wrong.";
@@ -51,6 +54,7 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
+    logError("gps", "Request handling error", error);
     return NextResponse.json(
       {
         error: error instanceof Error ? error.message : "Something went wrong.",

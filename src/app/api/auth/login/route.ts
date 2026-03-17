@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { logError } from "@/lib/logger";
 import { getAppStatus, getSessionSecret, verifyOwnerLogin } from "@/lib/server-state";
 import { createSessionToken, getSessionCookieOptions, SESSION_COOKIE_NAME } from "@/lib/session";
 
@@ -29,6 +30,7 @@ export async function POST(request: Request) {
     response.cookies.set(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
     return response;
   } catch (error) {
+    logError("auth/login", "Login error", error);
     const message = error instanceof Error ? error.message : "Unable to log in.";
     return NextResponse.json({ error: message }, { status: 500 });
   }

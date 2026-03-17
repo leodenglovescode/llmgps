@@ -6,6 +6,7 @@ import {
   type ConversationMessage,
 } from "@/lib/chat-history";
 import { getAuthenticatedUsername } from "@/lib/server-auth";
+import { logError } from "@/lib/logger";
 import { listConversationHistory, saveConversationHistory } from "@/lib/server-state";
 
 type SaveConversationPayload = {
@@ -48,6 +49,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ conversation });
   } catch (error) {
+    logError("conversations", "Save conversation error", error);
     const message = error instanceof Error ? error.message : "Unable to save the conversation.";
     return NextResponse.json({ error: message }, { status: 500 });
   }

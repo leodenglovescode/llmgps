@@ -6,6 +6,7 @@ import {
   getProvider,
 } from "@/lib/llm";
 import { type WebSearchConfig } from "@/lib/app-config";
+import { logError } from "@/lib/logger";
 
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
@@ -34,6 +35,7 @@ export type ClientGpsRequestPayload = {
   messages: ChatMessage[];
   responderModels: ModelSelection[];
   synthesizerModel?: ModelSelection | null;
+  webSearchEnabled?: boolean;
 };
 
 export type GpsExecutionPayload = ClientGpsRequestPayload & {
@@ -207,21 +209,21 @@ async function maybeInjectWebSearch(
   messages: ChatMessage[],
   config: WebSearchConfig | undefined,
   proxyUrl?: string,
-): Promise<{ messages: ChatMessage[]; searched: boolean }> {
+): Promise<{ messages: ChatMessage[]; searched: boolean; results: WebSearchResult[] }> {
   if (!config?.enabled || !config.apiKey?.trim()) {
-    return { messages, searched: false };
+    return { messages, searched: false, results: [] };
   }
 
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (!lastUserMessage) {
-    return { messages, searched: false };
+    return { messages, searched: false, results: [] };
   }
 
   try {
     const results = await fetchWebSearchResults(lastUserMessage.content, config, proxyUrl);
     const block = buildSearchContextBlock(results);
     if (!block) {
-      return { messages, searched: false };
+      return { messages, searched: false, results: [] };
     }
 
     return {
@@ -231,9 +233,10 @@ async function maybeInjectWebSearch(
         ...messages,
       ],
       searched: true,
+      results,
     };
   } catch {
-    return { messages, searched: false };
+    return { messages, searched: false, results: [] };
   }
 }
 
@@ -307,6 +310,18 @@ async function parseError(response: Response) {
   }
 }
 
+function extractErrorMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "The provider request failed.";
+
+  // Node.js native fetch wraps the real cause inside error.cause
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message) {
+    return `${error.message}: ${cause.message}`;
+  }
+
+  return error.message;
+}
+
 function normalizeProviderError(error: unknown) {
   if (error instanceof GpsError) {
     return error;
@@ -326,9 +341,8 @@ function normalizeProviderError(error: unknown) {
     );
   }
 
-  return error instanceof Error
-    ? new GpsError(error.message, 500)
-    : new GpsError("The provider request failed.", 500);
+  logError("provider", extractErrorMessage(error), error);
+  return new GpsError(extractErrorMessage(error), 500);
 }
 
 async function sendOpenAICompatibleMessage(
@@ -717,7 +731,9 @@ export type GpsStreamEvent =
   | { type: 'progress'; message: string }
   | { type: 'result'; payload: GpsResponsePayload }
   | { type: 'error'; error: string }
-  | { type: 'opinion'; model: string; content: string; phase: 'initial' | 'debate' };
+  | { type: 'opinion'; model: string; content: string; phase: 'initial' | 'debate' }
+  | { type: 'webSearchResults'; results: WebSearchResult[] }
+  | { type: 'synthesisError'; error: string; partialPayload: GpsResponsePayload };
 
 export async function* runGpsWorkflowStreaming(
   payload: GpsExecutionPayload,
@@ -739,7 +755,7 @@ export async function* runGpsWorkflowStreaming(
     yield { type: 'progress', message: 'Searching the web...' };
   }
 
-  const { messages: enrichedMessages, searched } = await maybeInjectWebSearch(
+  const { messages: enrichedMessages, searched, results: webResults } = await maybeInjectWebSearch(
     cleanMessages,
     payload.webSearchConfig,
     payload.proxyUrl,
@@ -747,6 +763,7 @@ export async function* runGpsWorkflowStreaming(
 
   if (searched) {
     yield { type: 'progress', message: 'Web search results injected.' };
+    yield { type: 'webSearchResults', results: webResults };
   }
 
   const primaryModel = payload.responderModels[0];
@@ -757,13 +774,22 @@ export async function* runGpsWorkflowStreaming(
     yield { type: 'progress', message: `Trying to access ${(primaryModel.label || primaryModel.modelId)} API...` };
     yield { type: 'progress', message: `Sending prompt to ${(primaryModel.label || primaryModel.modelId)}...` };
 
-    const content = await sendModelMessage(
-      primaryModel,
-      apiKey,
-      enrichedMessages,
-      payload.ollamaBaseUrl,
-      payload.proxyUrl,
-    );
+    let content: string;
+    try {
+      content = await sendModelMessage(
+        primaryModel,
+        apiKey,
+        enrichedMessages,
+        payload.ollamaBaseUrl,
+        payload.proxyUrl,
+      );
+    } catch (singleModelError) {
+      const normalized = normalizeProviderError(singleModelError);
+      throw new GpsError(
+        `${primaryModel.label || primaryModel.modelId}: ${normalized.message}`,
+        normalized.status,
+      );
+    }
     yield {
       type: 'result',
       payload: {
@@ -864,7 +890,7 @@ export async function* runGpsWorkflowStreaming(
         debateOpinions.push(result.value);
       } else {
         const model = initialOpinions[index];
-        console.error(`[Debate Phase] Model ${model.modelId} failed:`, result.reason);
+        logError("debate", `Model ${model.modelId} failed`, result.reason);
         failures.push({
           ...model,
           error: "Failed during debate phase: " + (result.reason instanceof Error ? result.reason.message : "Unknown"),
@@ -889,26 +915,78 @@ export async function* runGpsWorkflowStreaming(
 
   yield { type: 'progress', message: `Synthesizing answers with ${(synthesizerModel.label || synthesizerModel.modelId)}...` };
 
-  const consensus = await sendModelMessage(
-    synthesizerModel,
-    synthesizerApiKey,
-    [
-      {
-        role: "user",
-        content: buildSynthesisMessage(cleanMessages, finalOpinions),
-      },
-    ],
-    payload.ollamaBaseUrl,
-  );
+  const partialPayload: GpsResponsePayload = {
+    consensus: "",
+    failures,
+    mode: payload.debateMode ? "debate" : "gps",
+    opinions: finalOpinions,
+    responderCount: payload.responderModels.length,
+  };
+
+  let consensus: string;
+  try {
+    consensus = await sendModelMessage(
+      synthesizerModel,
+      synthesizerApiKey,
+      [
+        {
+          role: "user",
+          content: buildSynthesisMessage(cleanMessages, finalOpinions),
+        },
+      ],
+      payload.ollamaBaseUrl,
+      payload.proxyUrl,
+    );
+  } catch (synthError) {
+    const normalized = normalizeProviderError(synthError);
+    logError("synthesis", `Synthesizer ${synthesizerModel.modelId} failed`, synthError);
+    yield {
+      type: 'synthesisError',
+      error: `${synthesizerModel.label || synthesizerModel.modelId}: ${normalized.message}`,
+      partialPayload,
+    };
+    return;
+  }
 
   yield {
     type: 'result',
     payload: {
+      ...partialPayload,
       consensus,
-      failures,
-      mode: payload.debateMode ? "debate" : "gps",
-      opinions: finalOpinions,
-      responderCount: payload.responderModels.length,
     }
   };
+}
+
+export type SynthesisRetryPayload = {
+  messages: ChatMessage[];
+  opinions: ModelOpinion[];
+  synthesizerModel: ModelSelection;
+  mode: "gps" | "debate";
+};
+
+export type SynthesisRetryExecutionPayload = SynthesisRetryPayload & {
+  apiKeys: ApiKeyMap;
+  ollamaBaseUrl?: string;
+  proxyUrl?: string;
+};
+
+export async function runSynthesisOnly(
+  payload: SynthesisRetryExecutionPayload,
+): Promise<string> {
+  const apiKey = getRequiredProviderSecret(payload.synthesizerModel, payload.apiKeys);
+
+  const cleanMessages = payload.messages
+    .filter(
+      (m): m is ChatMessage =>
+        Boolean(m?.content?.trim()) && (m.role === "user" || m.role === "assistant"),
+    )
+    .map((m) => ({ role: m.role, content: m.content.trim() }));
+
+  return sendModelMessage(
+    payload.synthesizerModel,
+    apiKey,
+    [{ role: "user", content: buildSynthesisMessage(cleanMessages, payload.opinions) }],
+    payload.ollamaBaseUrl,
+    payload.proxyUrl,
+  );
 }

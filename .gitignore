@@ -39,6 +39,9 @@ yarn-error.log*
 .llmgps-data.sqlite-wal
 .llmgps-data.key
 
+# logs
+/logs/
+
 # vercel
 .vercel
 

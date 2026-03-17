@@ -21,7 +21,7 @@ import {
   type ConversationRecord,
   type ConversationSummary,
 } from "@/lib/chat-history";
-import type { GpsResponsePayload } from "@/lib/gps";
+import type { GpsResponsePayload, ModelOpinion } from "@/lib/gps";
 import {
   type ChatMessage,
   type ModelSelection,
@@ -36,6 +36,12 @@ type ViewId = "chat" | "runs" | "settings";
 type AuthView = "app" | "loading" | "login" | "setup";
 
 type UiMessage = ConversationMessage;
+
+type WebSearchResultItem = {
+  title: string;
+  url: string;
+  snippet: string;
+};
 
 type PersistedState = {
   customModels: ModelSelection[];
@@ -194,7 +200,19 @@ export function LlmgpsShell() {
   const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
   const [draft, setDraft] = useState("");
   const [gpsMode, setGpsMode] = useState(true);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(false);
+  const [webSearchResults, setWebSearchResults] = useState<WebSearchResultItem[]>([]);
+  const [thoughtsExpanded, setThoughtsExpanded] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [synthRetryOpen, setSynthRetryOpen] = useState(false);
+  const [synthRetryError, setSynthRetryError] = useState<string | null>(null);
+  const [synthRetryModel, setSynthRetryModel] = useState<ModelSelection | null>(null);
+  const [synthRetryBusy, setSynthRetryBusy] = useState(false);
+  const [synthRetryContext, setSynthRetryContext] = useState<{
+    messages: ChatMessage[];
+    opinions: ModelOpinion[];
+    partialPayload: GpsResponsePayload;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [settingsBusy, setSettingsBusy] = useState<string | null>(null);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(null);
@@ -217,6 +235,7 @@ export function LlmgpsShell() {
     setResponderModels(nextPreferences.responderModels);
     setSynthesizerModel(nextPreferences.synthesizerModel);
     setDebateMode(nextPreferences.debateMode);
+    if (nextPreferences.debateMode) setGpsMode(false);
   }
 
   function applyStatus(nextStatus: AppStatusPayload, options?: { syncRoutingPreferences?: boolean }) {
@@ -224,6 +243,11 @@ export function LlmgpsShell() {
     setOllamaConfig(nextStatus.authenticated ? nextStatus.ollamaConfig : { ...defaultOllamaConfig });
     setProxyConfig(nextStatus.authenticated ? nextStatus.proxyConfig : { ...defaultProxyConfig });
     setWebSearchConfig(nextStatus.authenticated ? nextStatus.webSearchConfig : { ...defaultWebSearchConfig });
+    if (nextStatus.authenticated && nextStatus.webSearchConfig.apiKey?.trim()) {
+      setWebSearchEnabled(nextStatus.webSearchConfig.enabled);
+    } else {
+      setWebSearchEnabled(false);
+    }
     setAuthView(nextStatus.initialized ? (nextStatus.authenticated ? "app" : "login") : "setup");
 
     if (options?.syncRoutingPreferences && nextStatus.authenticated) {
@@ -241,6 +265,8 @@ export function LlmgpsShell() {
     setError(null);
     setLastRun(null);
     setProgressMsg("");
+    setWebSearchResults([]);
+    setThoughtsExpanded(false);
   }
 
   function getPersistableMessages(nextMessages: UiMessage[]) {
@@ -444,8 +470,9 @@ export function LlmgpsShell() {
       setCustomModels(persisted.customModels || []);
       setResponderModels(persisted.responderModels || []);
       setSynthesizerModel(persisted.synthesizerModel || null);
-      if (persisted.debateMode !== undefined) {
-        setDebateMode(Boolean(persisted.debateMode));
+      if (persisted.debateMode) {
+        setDebateMode(true);
+        setGpsMode(false);
       }
     }
     setTheme(loadTheme());
@@ -568,7 +595,7 @@ export function LlmgpsShell() {
       return;
     }
 
-    void refreshConversationHistoryEvent({ autoload: true });
+    void refreshConversationHistoryEvent({});
   }, [hydrated, status.authenticated]);
 
   const connectedProviders = useMemo(
@@ -1022,6 +1049,8 @@ export function LlmgpsShell() {
     setDraft("");
     setBusy(true);
     setError(null);
+    setWebSearchResults([]);
+    setThoughtsExpanded(false);
 
     try {
       let workingConversationId = conversationId;
@@ -1047,6 +1076,7 @@ export function LlmgpsShell() {
           messages: payloadMessages,
           responderModels,
           synthesizerModel,
+          webSearchEnabled,
         }),
       });
 
@@ -1081,8 +1111,10 @@ export function LlmgpsShell() {
             error?: string;
             message?: string;
             model?: string;
+            partialPayload?: GpsResponsePayload;
             payload?: GpsResponsePayload;
             phase?: "debate" | "initial";
+            results?: WebSearchResultItem[];
             type?: string;
           };
           try {
@@ -1091,8 +1123,10 @@ export function LlmgpsShell() {
               error?: string;
               message?: string;
               model?: string;
+              partialPayload?: GpsResponsePayload;
               payload?: GpsResponsePayload;
               phase?: "debate" | "initial";
+              results?: WebSearchResultItem[];
               type?: string;
             };
           } catch (parseError) {
@@ -1102,6 +1136,8 @@ export function LlmgpsShell() {
 
           if (parsed.type === "progress") {
             setProgressMsg(parsed.message || "Working...");
+          } else if (parsed.type === "webSearchResults" && Array.isArray(parsed.results)) {
+            setWebSearchResults(parsed.results);
           } else if (parsed.type === "result") {
             finalResult = parsed.payload || null;
           } else if (parsed.type === "opinion" && parsed.content && parsed.model && parsed.phase) {
@@ -1118,6 +1154,23 @@ export function LlmgpsShell() {
             };
             workingMessages = [...workingMessages, opinionMessage];
             setMessages(workingMessages);
+          } else if (parsed.type === "synthesisError" && parsed.partialPayload) {
+            const partial = parsed.partialPayload;
+            setLastRun(partial);
+            setSynthRetryContext({
+              messages: payloadMessages,
+              opinions: partial.opinions as ModelOpinion[],
+              partialPayload: partial,
+            });
+            setSynthRetryError(parsed.error || "Synthesis failed.");
+            setSynthRetryModel(synthesizerModel);
+            setSynthRetryOpen(true);
+            setProgressMsg("");
+            setBusy(false);
+            try {
+              await persistConversation(workingMessages, partial, workingConversationId);
+            } catch { /* best effort */ }
+            return;
           } else if (parsed.type === "error") {
             throw new Error(parsed.error || "Unknown stream error");
           }
@@ -1156,6 +1209,62 @@ export function LlmgpsShell() {
       setProgressMsg("");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function retrySynthesis() {
+    if (!synthRetryContext || !synthRetryModel) return;
+
+    setSynthRetryBusy(true);
+    setSynthRetryError(null);
+
+    try {
+      const response = await fetch("/api/gps/synthesize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: synthRetryContext.messages,
+          opinions: synthRetryContext.opinions,
+          synthesizerModel: synthRetryModel,
+          mode: synthRetryContext.partialPayload.mode,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = (await response.json().catch(() => ({}))) as { error?: string };
+        if (response.status === 401) {
+          await refreshAppStatus().catch(() => undefined);
+          throw new Error("Session expired. Please log in again.");
+        }
+        throw new Error(data.error || `HTTP error ${response.status}`);
+      }
+
+      const data = (await response.json()) as { consensus: string };
+      const finalPayload: GpsResponsePayload = {
+        ...synthRetryContext.partialPayload,
+        consensus: data.consensus,
+      };
+
+      setLastRun(finalPayload);
+      setSynthesizerModel(synthRetryModel);
+
+      const nextMessages: UiMessage[] = [
+        ...messages,
+        { id: makeId(), role: "assistant", content: data.consensus },
+      ];
+      setMessages(nextMessages);
+      setSynthRetryOpen(false);
+      setSynthRetryContext(null);
+
+      try {
+        await persistConversation(nextMessages, finalPayload, conversationId);
+      } catch { /* best effort */ }
+    } catch (retryError) {
+      setSynthRetryError(
+        retryError instanceof Error ? retryError.message : "Synthesis retry failed.",
+      );
+    } finally {
+      setSynthRetryBusy(false);
     }
   }
 
@@ -1546,56 +1655,208 @@ export function LlmgpsShell() {
                   </h1>
                 </div>
               ) : (
-                messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={cx("message-entry flex flex-col gap-1", message.role === "assistant" ? "" : "items-end")}
-                  >
-                    <span className="px-1 text-xs font-semibold text-[var(--muted)]">
-                      {message.role === "assistant"
-                        ? message.isOpinion
-                          ? `${message.modelLabel} ${message.phase === "debate" ? "(Debating)" : "(Opinion)"}`
-                          : "llmgps"
-                        : "You"}
-                    </span>
-                    <div
-                      className={cx(
-                        "max-w-[90%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed sm:max-w-[85%]",
-                        message.role === "assistant"
-                          ? message.isOpinion
-                            ? "overflow-hidden border border-dashed border-[var(--border)] bg-[var(--surface-color)] text-[var(--muted)] opacity-90"
-                            : "markdown-body border border-[var(--border)] bg-[var(--surface-color)]"
-                          : "bg-[var(--foreground)] text-[var(--background)]",
-                      )}
-                    >
-                      {message.role === "assistant" ? (
-                        message.isOpinion ? (
-                          <div className="line-clamp-1 truncate italic">
-                            {message.content.split("\n")[0].replace(/[*#`]/g, "")}
-                          </div>
-                        ) : (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                        )
-                      ) : (
-                        <p className="whitespace-pre-wrap">{message.content}</p>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void copyToClipboard(message.content, message.id)}
-                      className="group px-1 py-2 text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
-                      title="Copy message"
-                    >
-                      <span className="text-sm group-hover:hidden">
-                        {copiedMessageId === message.id ? "✓" : "📋"}
-                      </span>
-                      <span className="hidden text-xs group-hover:inline">
-                        {copiedMessageId === message.id ? "✓ Copied" : "📋 Copy"}
-                      </span>
-                    </button>
-                  </div>
-                ))
+                (() => {
+                  const elements: React.ReactNode[] = [];
+                  let opinionGroup: UiMessage[] = [];
+                  // Collect "thought process" nodes that will be collapsed once synthesis is done
+                  let thoughtNodes: React.ReactNode[] = [];
+                  let synthesized = false;
+
+                  function flushOpinions() {
+                    if (opinionGroup.length === 0) return;
+                    const group = opinionGroup;
+                    opinionGroup = [];
+                    const phase = group[0].phase === "debate" ? "Debate" : "Opinions";
+                    thoughtNodes.push(
+                      <div key={`opinions-${group[0].id}`} className="message-entry flex flex-col gap-1">
+                        <span className="px-1 text-xs font-semibold text-[var(--muted)]">
+                          {phase} ({group.length} models)
+                        </span>
+                        <div className="max-w-[90%] rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-color)] sm:max-w-[85%]">
+                          {group.map((op, i) => (
+                            <div
+                              key={op.id}
+                              className={cx(
+                                "flex items-baseline gap-2 px-3 py-1.5 text-xs",
+                                i > 0 && "border-t border-[var(--border)]",
+                              )}
+                            >
+                              <span className="shrink-0 font-semibold text-[var(--muted)]">{op.modelLabel}</span>
+                              <span className="truncate italic text-[var(--muted)] opacity-80">
+                                {op.content.split("\n")[0].replace(/[*#`]/g, "")}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => void copyToClipboard(op.content, op.id)}
+                                className="ml-auto shrink-0 text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                                title="Copy opinion"
+                              >
+                                {copiedMessageId === op.id ? "✓" : "📋"}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>,
+                    );
+                  }
+
+                  function flushThoughts(beforeKey: string) {
+                    if (thoughtNodes.length === 0) return;
+                    const nodes = thoughtNodes;
+                    thoughtNodes = [];
+                    synthesized = true;
+                    elements.push(
+                      <div key={`thoughts-${beforeKey}`}>
+                        <button
+                          type="button"
+                          onClick={() => setThoughtsExpanded((v) => !v)}
+                          className="flex items-center gap-1.5 px-1 py-1 text-xs text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                        >
+                          <span
+                            className="inline-block transition-transform"
+                            style={{ transform: thoughtsExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
+                          >
+                            ▸
+                          </span>
+                          {thoughtsExpanded ? "Collapse Thought Process" : "Expand Thought Process"}
+                        </button>
+                        {thoughtsExpanded ? (
+                          <div className="mt-2 space-y-4">{nodes}</div>
+                        ) : null}
+                      </div>,
+                    );
+                  }
+
+                  for (const message of messages) {
+                    if (message.isOpinion) {
+                      if (opinionGroup.length > 0 && opinionGroup[0].phase !== message.phase) {
+                        flushOpinions();
+                      }
+                      opinionGroup.push(message);
+                      continue;
+                    }
+                    flushOpinions();
+
+                    // Non-opinion assistant message after thought nodes = synthesis done
+                    if (message.role === "assistant" && thoughtNodes.length > 0) {
+                      // Also inject web search results into thoughts if present
+                      if (webSearchResults.length > 0) {
+                        thoughtNodes.push(
+                          <div key="websearch-thoughts" className="message-entry flex flex-col gap-1">
+                            <span className="px-1 text-xs font-semibold text-[var(--muted)]">
+                              🔍 Web Search ({webSearchResults.length} results)
+                            </span>
+                            <div className="max-w-[90%] rounded-xl border border-[var(--border)] bg-[var(--surface-color)] sm:max-w-[85%]">
+                              {webSearchResults.map((result, i) => {
+                                let displayUrl: string;
+                                try {
+                                  displayUrl = new URL(result.url).hostname;
+                                } catch {
+                                  displayUrl = result.url;
+                                }
+                                return (
+                                  <div
+                                    key={i}
+                                    className={cx(
+                                      "px-3 py-2",
+                                      i > 0 && "border-t border-[var(--border)]",
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-2">
+                                      <span className="text-xs font-semibold text-[var(--foreground)]">{result.title}</span>
+                                    </div>
+                                    <div className="text-[11px] text-cyan-500">{displayUrl}</div>
+                                    <div className="mt-0.5 line-clamp-1 text-xs text-[var(--muted)]">{result.snippet}</div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>,
+                        );
+                      }
+                      flushThoughts(message.id);
+                    }
+
+                    elements.push(
+                      <div
+                        key={message.id}
+                        className={cx("message-entry flex flex-col gap-1", message.role === "assistant" ? "" : "items-end")}
+                      >
+                        <span className="px-1 text-xs font-semibold text-[var(--muted)]">
+                          {message.role === "assistant" ? "llmgps" : "You"}
+                        </span>
+                        <div
+                          className={cx(
+                            "max-w-[90%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed sm:max-w-[85%]",
+                            message.role === "assistant"
+                              ? "markdown-body border border-[var(--border)] bg-[var(--surface-color)]"
+                              : "bg-[var(--foreground)] text-[var(--background)]",
+                          )}
+                        >
+                          {message.role === "assistant" ? (
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                          ) : (
+                            <p className="whitespace-pre-wrap">{message.content}</p>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => void copyToClipboard(message.content, message.id)}
+                          className="group px-1 py-2 text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                          title="Copy message"
+                        >
+                          <span className="text-sm group-hover:hidden">
+                            {copiedMessageId === message.id ? "✓" : "📋"}
+                          </span>
+                          <span className="hidden text-xs group-hover:inline">
+                            {copiedMessageId === message.id ? "✓ Copied" : "📋 Copy"}
+                          </span>
+                        </button>
+                      </div>,
+                    );
+                  }
+                  // If there are unflushed opinions (synthesis not done yet / still streaming), show them directly
+                  flushOpinions();
+                  if (thoughtNodes.length > 0 && !synthesized) {
+                    elements.push(...thoughtNodes);
+                    thoughtNodes = [];
+                  }
+
+                  return elements;
+                })()
               )}
+              {webSearchResults.length > 0 && !lastRun?.consensus ? (
+                <div className="message-entry flex flex-col gap-1">
+                  <span className="px-1 text-xs font-semibold text-[var(--muted)]">
+                    🔍 Web Search ({webSearchResults.length} results)
+                  </span>
+                  <div className="max-w-[90%] rounded-xl border border-[var(--border)] bg-[var(--surface-color)] sm:max-w-[85%]">
+                    {webSearchResults.map((result, i) => {
+                      let displayUrl: string;
+                      try {
+                        displayUrl = new URL(result.url).hostname;
+                      } catch {
+                        displayUrl = result.url;
+                      }
+                      return (
+                        <div
+                          key={i}
+                          className={cx(
+                            "px-3 py-2",
+                            i > 0 && "border-t border-[var(--border)]",
+                          )}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs font-semibold text-[var(--foreground)]">{result.title}</span>
+                          </div>
+                          <div className="text-[11px] text-cyan-500">{displayUrl}</div>
+                          <div className="mt-0.5 line-clamp-1 text-xs text-[var(--muted)]">{result.snippet}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
               {busy ? (
                 <div className="message-entry flex flex-col gap-1 items-start">
                   <span className="px-1 text-xs font-semibold text-[var(--muted)]">
@@ -1682,6 +1943,27 @@ export function LlmgpsShell() {
                       />
                       Debate Mode
                     </button>
+                    {webSearchConfig.enabled && webSearchConfig.apiKey?.trim() ? (
+                      <button
+                        type="button"
+                        onClick={() => setWebSearchEnabled((v) => !v)}
+                        className={cx(
+                          "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors",
+                          webSearchEnabled
+                            ? "border-[var(--border)] bg-[var(--surface-subtle)] text-[var(--foreground)]"
+                            : "border-transparent text-[var(--muted)] hover:text-[var(--foreground)]",
+                        )}
+                        title="Search the web before responding"
+                      >
+                        <span
+                          className={cx(
+                            "h-1.5 w-1.5 rounded-full",
+                            webSearchEnabled ? "bg-cyan-500" : "bg-[var(--muted)]",
+                          )}
+                        />
+                        Web Search
+                      </button>
+                    ) : null}
                     <div className="flex items-center px-2 py-1 text-xs text-[var(--muted)]">
                       {responderModels.length} responders
                     </div>
@@ -2457,6 +2739,68 @@ export function LlmgpsShell() {
           </div>
         ) : null}
       </div>
+
+      {synthRetryOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="mx-4 w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--background)] p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold">Synthesis Failed</h2>
+            {synthRetryError ? (
+              <p className="mt-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+                {synthRetryError}
+              </p>
+            ) : null}
+            <p className="mt-3 text-sm text-[var(--muted)]">
+              Choose a different model and retry synthesis. Your opinions are preserved above.
+            </p>
+
+            <div className="mt-4 space-y-1">
+              {availableModels.map((model) => {
+                const key = serializeModelSelection(model);
+                const selected = synthRetryModel ? serializeModelSelection(synthRetryModel) === key : false;
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    onClick={() => setSynthRetryModel(model)}
+                    className={cx(
+                      "flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors",
+                      selected
+                        ? "border border-[var(--border)] bg-[var(--surface-subtle)] font-medium text-[var(--foreground)]"
+                        : "text-[var(--muted)] hover:bg-[var(--surface-color)] hover:text-[var(--foreground)]",
+                    )}
+                  >
+                    <span className={cx("h-2 w-2 shrink-0 rounded-full", selected ? "bg-cyan-500" : "bg-transparent")} />
+                    <span>{model.label}</span>
+                    <span className="ml-auto text-xs text-[var(--muted)]">{model.providerId}</span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => {
+                  setSynthRetryOpen(false);
+                  setSynthRetryContext(null);
+                  setSynthRetryError(null);
+                }}
+                className="rounded-lg px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+              >
+                Dismiss
+              </button>
+              <button
+                type="button"
+                disabled={!synthRetryModel || synthRetryBusy}
+                onClick={() => void retrySynthesis()}
+                className="rounded-lg bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity disabled:opacity-40"
+              >
+                {synthRetryBusy ? "Synthesizing…" : "Retry Synthesis"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

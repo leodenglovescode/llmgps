@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { logError } from "@/lib/logger";
 import { initializeOwner } from "@/lib/server-state";
 
 export async function POST(request: Request) {
@@ -19,6 +20,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
+    logError("auth/setup", "Setup error", error);
     const message = error instanceof Error ? error.message : "Unable to complete setup.";
     const status = message.includes("already") ? 409 : 500;
     return NextResponse.json({ error: message }, { status });
