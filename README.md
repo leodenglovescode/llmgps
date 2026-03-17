@@ -3,7 +3,11 @@
 [![Docker](https://img.shields.io/badge/docker-ghcr.io-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://github.com/leodenglovescode/llmgps/pkgs/container/llmgps)
 [![CI](https://img.shields.io/github/actions/workflow/status/leodenglovescode/llmgps/docker-publish.yml?style=for-the-badge&label=CI&logo=githubactions&logoColor=white)](https://github.com/leodenglovescode/llmgps/actions)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black?style=for-the-badge&logo=next.js&logoColor=white)](https://nextjs.org)
+[![React](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind-4-06B6D4?style=for-the-badge&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
+[![GitHub Stars](https://img.shields.io/github/stars/leodenglovescode/llmgps?style=for-the-badge&logo=github&logoColor=white&color=gold)](https://github.com/leodenglovescode/llmgps/stargazers)
+[![Last Commit](https://img.shields.io/github/last-commit/leodenglovescode/llmgps?style=for-the-badge&logo=github&logoColor=white)](https://github.com/leodenglovescode/llmgps/commits/main)
 [![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?style=for-the-badge)](LICENSE)
 
 llmgps is a self-hostable multi-LLM chat workspace.
