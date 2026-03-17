@@ -5,6 +5,7 @@ import {
   GPS_SYNTHESIS_PROMPT,
   getProvider,
 } from "@/lib/llm";
+import { type WebSearchConfig } from "@/lib/app-config";
 
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { SocksProxyAgent } from "socks-proxy-agent";
@@ -39,6 +40,7 @@ export type GpsExecutionPayload = ClientGpsRequestPayload & {
   apiKeys: ApiKeyMap;
   ollamaBaseUrl?: string;
   proxyUrl?: string;
+  webSearchConfig?: WebSearchConfig;
 };
 
 export type ModelOpinion = ModelSelection & {
@@ -52,7 +54,7 @@ export type ModelFailure = ModelSelection & {
 export type GpsResponsePayload = {
   consensus: string;
   failures: ModelFailure[];
-  mode: "gps" | "single";
+  mode: "gps" | "debate" | "single";
   opinions: ModelOpinion[];
   responderCount: number;
 };
@@ -98,6 +100,140 @@ export class GpsError extends Error {
     super(message);
     this.name = "GpsError";
     this.status = status;
+  }
+}
+
+type BraveWebResult = {
+  title?: string;
+  url?: string;
+  description?: string;
+};
+
+type BraveSearchResponse = {
+  web?: { results?: BraveWebResult[] };
+};
+
+type TavilySearchResult = {
+  title?: string;
+  url?: string;
+  content?: string;
+};
+
+type TavilySearchResponse = {
+  results?: TavilySearchResult[];
+};
+
+type WebSearchResult = {
+  title: string;
+  url: string;
+  snippet: string;
+};
+
+const WEB_SEARCH_TIMEOUT_MS = 15_000;
+
+async function fetchWebSearchResults(
+  query: string,
+  config: WebSearchConfig,
+  proxyUrl?: string,
+): Promise<WebSearchResult[]> {
+  if (config.provider === "tavily") {
+    const response = await proxyFetch(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key: config.apiKey,
+          query,
+          max_results: config.maxResults,
+          search_depth: "basic",
+        }),
+        signal: AbortSignal.timeout(WEB_SEARCH_TIMEOUT_MS),
+      },
+      proxyUrl,
+    );
+
+    if (!response.ok) {
+      throw new GpsError(`Tavily search failed (${response.status}).`, 502);
+    }
+
+    const data = (await response.json()) as TavilySearchResponse;
+    return (data.results ?? []).map((r) => ({
+      title: r.title ?? "",
+      url: r.url ?? "",
+      snippet: r.content ?? "",
+    })).filter((r) => r.snippet);
+  }
+
+  // Brave Search
+  const params = new URLSearchParams({ q: query, count: String(config.maxResults) });
+  const response = await proxyFetch(
+    `https://api.search.brave.com/res/v1/web/search?${params.toString()}`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": config.apiKey,
+      },
+      signal: AbortSignal.timeout(WEB_SEARCH_TIMEOUT_MS),
+    },
+    proxyUrl,
+  );
+
+  if (!response.ok) {
+    throw new GpsError(`Brave search failed (${response.status}).`, 502);
+  }
+
+  const data = (await response.json()) as BraveSearchResponse;
+  return (data.web?.results ?? []).map((r) => ({
+    title: r.title ?? "",
+    url: r.url ?? "",
+    snippet: r.description ?? "",
+  })).filter((r) => r.snippet);
+}
+
+function buildSearchContextBlock(results: WebSearchResult[]): string {
+  if (results.length === 0) return "";
+
+  const lines = results.map(
+    (r, i) => `${i + 1}. ${r.title} (${r.url}): ${r.snippet}`,
+  );
+
+  return `[Web Search Results — ${new Date().toISOString().slice(0, 10)}]\n${lines.join("\n")}`;
+}
+
+async function maybeInjectWebSearch(
+  messages: ChatMessage[],
+  config: WebSearchConfig | undefined,
+  proxyUrl?: string,
+): Promise<{ messages: ChatMessage[]; searched: boolean }> {
+  if (!config?.enabled || !config.apiKey?.trim()) {
+    return { messages, searched: false };
+  }
+
+  const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
+  if (!lastUserMessage) {
+    return { messages, searched: false };
+  }
+
+  try {
+    const results = await fetchWebSearchResults(lastUserMessage.content, config, proxyUrl);
+    const block = buildSearchContextBlock(results);
+    if (!block) {
+      return { messages, searched: false };
+    }
+
+    return {
+      messages: [
+        { role: "user" as const, content: block },
+        { role: "assistant" as const, content: "Thank you for the web search context. I will use these results to inform my response." },
+        ...messages,
+      ],
+      searched: true,
+    };
+  } catch {
+    return { messages, searched: false };
   }
 }
 
@@ -479,6 +615,12 @@ export async function runGpsWorkflow(
       content: message.content.trim(),
     }));
 
+  const { messages: enrichedMessages } = await maybeInjectWebSearch(
+    cleanMessages,
+    payload.webSearchConfig,
+    payload.proxyUrl,
+  );
+
   const primaryModel = payload.responderModels[0];
 
   if (!payload.gpsMode && !payload.debateMode) {
@@ -486,7 +628,7 @@ export async function runGpsWorkflow(
     const content = await sendModelMessage(
       primaryModel,
       apiKey,
-      cleanMessages,
+      enrichedMessages,
       payload.ollamaBaseUrl,
       payload.proxyUrl,
     );
@@ -500,7 +642,7 @@ export async function runGpsWorkflow(
     };
   }
 
-  const opinionMessages = buildOpinionMessages(cleanMessages);
+  const opinionMessages = buildOpinionMessages(enrichedMessages);
   const settled = await Promise.allSettled(
     payload.responderModels.map(async (model) => {
       const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
@@ -593,6 +735,20 @@ export async function* runGpsWorkflowStreaming(
       content: message.content.trim(),
     }));
 
+  if (payload.webSearchConfig?.enabled && payload.webSearchConfig.apiKey?.trim()) {
+    yield { type: 'progress', message: 'Searching the web...' };
+  }
+
+  const { messages: enrichedMessages, searched } = await maybeInjectWebSearch(
+    cleanMessages,
+    payload.webSearchConfig,
+    payload.proxyUrl,
+  );
+
+  if (searched) {
+    yield { type: 'progress', message: 'Web search results injected.' };
+  }
+
   const primaryModel = payload.responderModels[0];
 
   if (!payload.gpsMode && !payload.debateMode) {
@@ -604,7 +760,7 @@ export async function* runGpsWorkflowStreaming(
     const content = await sendModelMessage(
       primaryModel,
       apiKey,
-      cleanMessages,
+      enrichedMessages,
       payload.ollamaBaseUrl,
       payload.proxyUrl,
     );
@@ -621,7 +777,7 @@ export async function* runGpsWorkflowStreaming(
     return;
   }
 
-  const opinionMessages = buildOpinionMessages(cleanMessages);
+  const opinionMessages = buildOpinionMessages(enrichedMessages);
   
   yield { type: 'progress', message: 'Sending prompt to responder models...' };
 
@@ -671,19 +827,24 @@ export async function* runGpsWorkflowStreaming(
   // Debate Round
   if (payload.debateMode && initialOpinions.length > 1) {
     yield { type: 'progress', message: 'Entering Debate Mode: cross-referencing AI responses...' };
-    const debateSystemPrompt = "You are an AI Assistant. You will now be given other LLMs responses to the original prompt. Debate whether you agree or disagree with other LLMs opinions. Do not limit your length, explain yourself fully.";
-    
-    // Construct the context of everyone else's opinions
-    const allOpinionsText = initialOpinions.map(o => `[${o.modelId}]:\n${o.content}`).join('\n\n---\n\n');
 
     const debateRoundSettled = await Promise.allSettled(
       initialOpinions.map(async (model) => {
         const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
 
+        const otherOpinionsText = initialOpinions
+          .filter((o) => o.modelId !== model.modelId)
+          .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
+          .join('\n\n---\n\n');
+
+        // Give each model: full conversation history + its own opinion as assistant turn + other models' opinions
         const debateMessages: ChatMessage[] = [
-          ...cleanMessages,
-          { role: 'assistant', content: 'Here are the responses from other models.\n\n' + allOpinionsText },
-          { role: 'user', content: debateSystemPrompt }
+          ...opinionMessages,
+          { role: 'assistant', content: model.content },
+          {
+            role: 'user',
+            content: `Here are the other AI models' responses to the same prompt:\n\n${otherOpinionsText}\n\nDo you agree or disagree with their responses? Debate their points clearly and concisely, referencing the conversation context where relevant.`,
+          },
         ];
 
         const content = await sendModelMessage(
@@ -745,7 +906,7 @@ export async function* runGpsWorkflowStreaming(
     payload: {
       consensus,
       failures,
-      mode: "gps",
+      mode: payload.debateMode ? "debate" : "gps",
       opinions: finalOpinions,
       responderCount: payload.responderModels.length,
     }

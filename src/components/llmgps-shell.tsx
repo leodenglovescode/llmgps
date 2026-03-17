@@ -8,10 +8,12 @@ import {
   defaultOllamaConfig,
   defaultProxyConfig,
   defaultRoutingPreferences,
+  defaultWebSearchConfig,
   type AppStatusPayload,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type WebSearchConfig,
 } from "@/lib/app-config";
 import {
   buildConversationSummary,
@@ -79,6 +81,7 @@ const initialStatus: AppStatusPayload = {
   routingPreferences: defaultRoutingPreferences,
   shouldPromptForApiKeys: false,
   username: null,
+  webSearchConfig: defaultWebSearchConfig,
 };
 
 function cx(...values: Array<string | false | null | undefined>) {
@@ -185,6 +188,7 @@ export function LlmgpsShell() {
   const [synthesizerModel, setSynthesizerModel] = useState<ModelSelection | null>(null);
   const [ollamaConfig, setOllamaConfig] = useState<OllamaConfig>(defaultOllamaConfig);
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>(defaultProxyConfig);
+  const [webSearchConfig, setWebSearchConfig] = useState<WebSearchConfig>(defaultWebSearchConfig);
   const [debateMode, setDebateMode] = useState<boolean>(false);
   const [progressMsg, setProgressMsg] = useState<string>("");
   const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
@@ -203,6 +207,10 @@ export function LlmgpsShell() {
   const [welcomeNow, setWelcomeNow] = useState(() => new Date());
   const [welcomeIndex, setWelcomeIndex] = useState(0);
   const [welcomeFading, setWelcomeFading] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [ollamaModels, setOllamaModels] = useState<string[]>([]);
+  const [ollamaModelsBusy, setOllamaModelsBusy] = useState(false);
+  const [ollamaModelsError, setOllamaModelsError] = useState<string | null>(null);
 
   function applyRoutingPreferences(nextPreferences: RoutingPreferencesPayload) {
     setCustomModels(nextPreferences.customModels);
@@ -215,6 +223,7 @@ export function LlmgpsShell() {
     setStatus(nextStatus);
     setOllamaConfig(nextStatus.authenticated ? nextStatus.ollamaConfig : { ...defaultOllamaConfig });
     setProxyConfig(nextStatus.authenticated ? nextStatus.proxyConfig : { ...defaultProxyConfig });
+    setWebSearchConfig(nextStatus.authenticated ? nextStatus.webSearchConfig : { ...defaultWebSearchConfig });
     setAuthView(nextStatus.initialized ? (nextStatus.authenticated ? "app" : "login") : "setup");
 
     if (options?.syncRoutingPreferences && nextStatus.authenticated) {
@@ -274,6 +283,7 @@ export function LlmgpsShell() {
     ollamaConfig?: OllamaConfig;
     proxyConfig?: ProxyConfig;
     routingPreferences?: RoutingPreferencesPayload;
+    webSearchConfig?: WebSearchConfig;
   }, options?: { syncRoutingPreferences?: boolean }) {
     const response = await fetch("/api/settings", {
       method: "POST",
@@ -761,6 +771,7 @@ export function LlmgpsShell() {
     setApiKeyDrafts(makeEmptyApiKeyDrafts());
   setOllamaConfig({ ...defaultOllamaConfig });
     setProxyConfig({ ...defaultProxyConfig });
+    setWebSearchConfig({ ...defaultWebSearchConfig });
 
     try {
       await refreshAppStatus();
@@ -864,6 +875,24 @@ export function LlmgpsShell() {
     }
   }
 
+  async function fetchOllamaModels() {
+    setOllamaModelsBusy(true);
+    setOllamaModelsError(null);
+
+    try {
+      const response = await fetch("/api/ollama/tags", { cache: "no-store" });
+      const data = (await response.json().catch(() => ({}))) as { models?: string[]; error?: string };
+      if (!response.ok) throw new Error(data.error || `HTTP error ${response.status}`);
+      const models = data.models ?? [];
+      if (models.length === 0) throw new Error("No models found. Is Ollama running at the configured URL?");
+      setOllamaModels(models);
+    } catch (fetchError) {
+      setOllamaModelsError(fetchError instanceof Error ? fetchError.message : "Could not reach Ollama.");
+    } finally {
+      setOllamaModelsBusy(false);
+    }
+  }
+
   async function saveOllamaSettings() {
     setSettingsBusy("ollama");
     setSettingsNotice(null);
@@ -879,6 +908,27 @@ export function LlmgpsShell() {
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "Unable to save Ollama settings.",
+      );
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
+  async function saveWebSearchSettings() {
+    setSettingsBusy("websearch");
+    setSettingsNotice(null);
+    setError(null);
+
+    try {
+      await saveSettings({ webSearchConfig });
+      setSettingsNotice(
+        webSearchConfig.enabled
+          ? "Web search settings saved on the server."
+          : "Web search disabled for this workspace.",
+      );
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Unable to save web search settings.",
       );
     } finally {
       setSettingsBusy(null);
@@ -911,6 +961,29 @@ export function LlmgpsShell() {
       );
     } finally {
       setSettingsBusy(null);
+    }
+  }
+
+  async function copyToClipboard(text: string, messageId: string) {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback for non-secure contexts or older browsers
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand("copy");
+        document.body.removeChild(textarea);
+      }
+      setCopiedMessageId(messageId);
+      window.setTimeout(() => setCopiedMessageId(null), 2000);
+    } catch (error) {
+      console.error("Clipboard error:", error);
+      setError("Failed to copy message to clipboard.");
     }
   }
 
@@ -1507,6 +1580,19 @@ export function LlmgpsShell() {
                         <p className="whitespace-pre-wrap">{message.content}</p>
                       )}
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => void copyToClipboard(message.content, message.id)}
+                      className="group px-1 py-2 text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                      title="Copy message"
+                    >
+                      <span className="text-sm group-hover:hidden">
+                        {copiedMessageId === message.id ? "✓" : "📋"}
+                      </span>
+                      <span className="hidden text-xs group-hover:inline">
+                        {copiedMessageId === message.id ? "✓ Copied" : "📋 Copy"}
+                      </span>
+                    </button>
                   </div>
                 ))
               )}
@@ -1763,14 +1849,59 @@ export function LlmgpsShell() {
                                 />
                               </div>
 
-                              <button
-                                type="button"
-                                onClick={() => void saveOllamaSettings()}
-                                disabled={settingsBusy !== null && settingsBusy !== "ollama"}
-                                className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                              >
-                                {settingsBusy === "ollama" ? "Saving..." : "Save Ollama"}
-                              </button>
+                              <div className="flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => void saveOllamaSettings()}
+                                  disabled={settingsBusy !== null && settingsBusy !== "ollama"}
+                                  className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                                >
+                                  {settingsBusy === "ollama" ? "Saving..." : "Save Ollama"}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => void fetchOllamaModels()}
+                                  disabled={ollamaModelsBusy}
+                                  className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-50"
+                                >
+                                  {ollamaModelsBusy ? "Fetching..." : "Fetch models"}
+                                </button>
+                              </div>
+
+                              {ollamaModelsError ? (
+                                <p className="text-xs text-red-500">{ollamaModelsError}</p>
+                              ) : null}
+
+                              {ollamaModels.length > 0 ? (
+                                <div className="space-y-2">
+                                  <p className="text-xs text-[var(--muted)]">Click a model to add it as a custom Ollama model:</p>
+                                  <div className="flex flex-wrap gap-2">
+                                    {ollamaModels.map((modelName) => {
+                                      const sel = createCustomModelSelection("ollama", modelName);
+                                      const key = serializeModelSelection(sel);
+                                      const alreadyAdded = customModels.some((m) => serializeModelSelection(m) === key);
+                                      return (
+                                        <button
+                                          key={modelName}
+                                          type="button"
+                                          disabled={alreadyAdded}
+                                          onClick={() => {
+                                            if (!alreadyAdded) setCustomModels((current) => [...current, sel]);
+                                          }}
+                                          className={cx(
+                                            "rounded-lg border px-2.5 py-1 text-xs transition-colors",
+                                            alreadyAdded
+                                              ? "border-[var(--border)] text-[var(--muted)] opacity-50 cursor-default"
+                                              : "border-[var(--border)] hover:border-[var(--foreground)] hover:bg-[var(--surface-muted)] cursor-pointer",
+                                          )}
+                                        >
+                                          {alreadyAdded ? "✓ " : "+ "}{modelName}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              ) : null}
                             </div>
                           )}
 
@@ -2037,6 +2168,125 @@ export function LlmgpsShell() {
                     className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
                     {settingsBusy === "proxy" ? "Saving proxy..." : "Save proxy settings"}
+                  </button>
+                </div>
+              </section>
+
+              <section className="space-y-4 pb-20">
+                <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Web Search
+                </h3>
+
+                <div className="mt-4 space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <label className="text-sm font-medium">Enable Web Search</label>
+                      <p className="text-xs text-[var(--muted)]">
+                        Fetch live web results and inject them as context before each LLM call.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setWebSearchConfig((current) => ({ ...current, enabled: !current.enabled }))
+                      }
+                      className={cx(
+                        "relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors",
+                        webSearchConfig.enabled ? "bg-green-500" : "bg-[var(--border)]",
+                      )}
+                    >
+                      <span
+                        className={cx(
+                          "pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow transition-transform",
+                          webSearchConfig.enabled ? "translate-x-5" : "translate-x-0",
+                        )}
+                      />
+                    </button>
+                  </div>
+
+                  {webSearchConfig.enabled ? (
+                    <div className="space-y-4">
+                      <div>
+                        <label className="mb-1 block text-xs text-[var(--muted)]">
+                          Search Provider
+                        </label>
+                        <select
+                          value={webSearchConfig.provider}
+                          onChange={(event) =>
+                            setWebSearchConfig((current) => ({
+                              ...current,
+                              provider: event.target.value as "brave" | "tavily",
+                            }))
+                          }
+                          className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus:border-[var(--muted)]"
+                        >
+                          <option value="brave">Brave Search</option>
+                          <option value="tavily">Tavily</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs text-[var(--muted)]">
+                          {webSearchConfig.provider === "brave" ? "Brave API Key" : "Tavily API Key"}
+                        </label>
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          placeholder={webSearchConfig.provider === "brave" ? "BSA..." : "tvly-..."}
+                          value={webSearchConfig.apiKey}
+                          onChange={(event) =>
+                            setWebSearchConfig((current) => ({
+                              ...current,
+                              apiKey: event.target.value,
+                            }))
+                          }
+                          className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus:border-[var(--muted)]"
+                        />
+                        <p className="mt-1 text-xs text-[var(--muted)]">
+                          {webSearchConfig.provider === "brave" ? (
+                            <>Get a free key at{" "}
+                              <a href="https://brave.com/search/api/" target="_blank" rel="noopener noreferrer" className="underline">
+                                brave.com/search/api
+                              </a>
+                              {" "}(2,000 req/month free).
+                            </>
+                          ) : (
+                            <>Get a free key at{" "}
+                              <a href="https://app.tavily.com/" target="_blank" rel="noopener noreferrer" className="underline">
+                                app.tavily.com
+                              </a>
+                              {" "}(1,000 req/month free).
+                            </>
+                          )}
+                        </p>
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-xs text-[var(--muted)]">
+                          Max Results (1–10)
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={10}
+                          value={webSearchConfig.maxResults}
+                          onChange={(event) =>
+                            setWebSearchConfig((current) => ({
+                              ...current,
+                              maxResults: Math.max(1, Math.min(10, Number(event.target.value) || 5)),
+                            }))
+                          }
+                          className="w-24 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus:border-[var(--muted)]"
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <button
+                    type="button"
+                    onClick={() => void saveWebSearchSettings()}
+                    disabled={settingsBusy !== null && settingsBusy !== "websearch"}
+                    className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                  >
+                    {settingsBusy === "websearch" ? "Saving..." : "Save web search settings"}
                   </button>
                 </div>
               </section>

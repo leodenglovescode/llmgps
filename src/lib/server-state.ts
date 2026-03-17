@@ -18,13 +18,16 @@ import {
   defaultOllamaConfig,
   defaultRoutingPreferences,
   defaultProxyConfig,
+  defaultWebSearchConfig,
   sanitizeOllamaConfig,
   sanitizeRoutingPreferences,
   sanitizeProxyConfig,
+  sanitizeWebSearchConfig,
   type AppStatusPayload,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type WebSearchConfig,
 } from "@/lib/app-config";
 import {
   buildConversationSummary,
@@ -49,6 +52,7 @@ type OwnerRecord = {
   routingPreferences: RoutingPreferencesPayload;
   shouldPromptForApiKeys: boolean;
   username: string;
+  webSearchConfig: WebSearchConfig;
 };
 
 type StoreRecord = {
@@ -62,6 +66,7 @@ type OwnerSecrets = {
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
   sessionSecret: string;
+  webSearchConfig: WebSearchConfig;
 };
 
 type OwnerRow = {
@@ -88,6 +93,7 @@ type SettingsUpdate = {
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
+  webSearchConfig?: Partial<WebSearchConfig>;
 };
 
 type ConversationRow = {
@@ -402,6 +408,7 @@ async function encryptSecrets(secrets: OwnerSecrets) {
     proxyConfig: sanitizeProxyConfig(secrets.proxyConfig),
     routingPreferences: sanitizeRoutingPreferences(secrets.routingPreferences),
     sessionSecret: secrets.sessionSecret,
+    webSearchConfig: sanitizeWebSearchConfig(secrets.webSearchConfig),
   } satisfies OwnerSecrets;
 
   return encryptPayload(payload);
@@ -439,6 +446,7 @@ async function decryptSecrets(rawEnvelope: string): Promise<OwnerSecrets> {
       typeof payload.sessionSecret === "string" && payload.sessionSecret.trim()
         ? payload.sessionSecret
         : randomBytes(32).toString("hex"),
+    webSearchConfig: sanitizeWebSearchConfig(payload.webSearchConfig),
   };
 }
 
@@ -507,6 +515,7 @@ async function readLegacyStore(legacyJsonPath: string) {
             },
             shouldPromptForApiKeys: Boolean(parsed.owner.shouldPromptForApiKeys),
             username: parsed.owner.username?.trim() ?? "",
+            webSearchConfig: { ...defaultWebSearchConfig },
           }
         : null,
       sessionSecret:
@@ -549,6 +558,7 @@ async function migrateLegacyJsonStore(database: DatabaseSync, legacyJsonPath: st
     proxyConfig: legacyOwner.proxyConfig,
     routingPreferences: defaultRoutingPreferences,
     sessionSecret: legacyStore.sessionSecret,
+    webSearchConfig: defaultWebSearchConfig,
   });
   const now = new Date().toISOString();
 
@@ -602,6 +612,7 @@ async function readStore() {
       routingPreferences: sanitizeRoutingPreferences(secrets.routingPreferences),
       shouldPromptForApiKeys: Boolean(row.should_prompt_for_api_keys),
       username: row.username,
+      webSearchConfig: sanitizeWebSearchConfig(secrets.webSearchConfig),
     },
     sessionSecret: secrets.sessionSecret,
   } satisfies StoreRecord;
@@ -615,6 +626,7 @@ async function writeOwner(owner: OwnerRecord, sessionSecret: string) {
     proxyConfig: owner.proxyConfig,
     routingPreferences: owner.routingPreferences,
     sessionSecret,
+    webSearchConfig: owner.webSearchConfig,
   });
   const now = new Date().toISOString();
 
@@ -671,6 +683,7 @@ export async function getAppStatus(username: string | null): Promise<AppStatusPa
       : defaultRoutingPreferences,
     shouldPromptForApiKeys: authenticated ? Boolean(owner?.shouldPromptForApiKeys) : false,
     username: authenticated ? owner?.username ?? null : null,
+    webSearchConfig: authenticated ? owner?.webSearchConfig ?? { ...defaultWebSearchConfig } : { ...defaultWebSearchConfig },
   };
 }
 
@@ -696,6 +709,7 @@ export async function initializeOwner(username: string, password: string) {
       routingPreferences: { ...defaultRoutingPreferences },
       shouldPromptForApiKeys: true,
       username: normalizedUsername,
+      webSearchConfig: { ...defaultWebSearchConfig },
     },
     randomBytes(32).toString("hex"),
   );
@@ -766,6 +780,13 @@ export async function saveOwnerSettings(update: SettingsUpdate) {
     owner.routingPreferences = sanitizeRoutingPreferences(update.routingPreferences);
   }
 
+  if (update.webSearchConfig) {
+    owner.webSearchConfig = sanitizeWebSearchConfig({
+      ...owner.webSearchConfig,
+      ...update.webSearchConfig,
+    });
+  }
+
   await writeOwner(owner, store.sessionSecret);
 
   return {
@@ -800,6 +821,7 @@ export async function getExecutionSettings() {
       ? store.owner.ollamaConfig.baseUrl.trim() || defaultOllamaConfig.baseUrl
       : undefined,
     proxyUrl: buildProxyUrl(store.owner.proxyConfig),
+    webSearchConfig: store.owner.webSearchConfig,
   };
 }
 

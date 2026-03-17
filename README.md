@@ -111,7 +111,7 @@ Only mount `/data` persistently. Do not persist a generated key file beside the 
 
 ## Credits
 Idea and Logic by @leodenglovescode
-Code written by Github Copilot
+Code assisted by Github Copilot
 
 ## Contributing
 If you are familiar with my project structure and general idea, please DO contribute!

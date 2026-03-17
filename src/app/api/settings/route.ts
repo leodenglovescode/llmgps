@@ -4,9 +4,11 @@ import {
   sanitizeOllamaConfig,
   sanitizeProxyConfig,
   sanitizeRoutingPreferences,
+  sanitizeWebSearchConfig,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type WebSearchConfig,
 } from "@/lib/app-config";
 import { getAuthenticatedUsername } from "@/lib/server-auth";
 import { getAppStatus, saveOwnerSettings } from "@/lib/server-state";
@@ -17,6 +19,7 @@ type SettingsPayload = {
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
+  webSearchConfig?: Partial<WebSearchConfig>;
 };
 
 export async function GET(request: NextRequest) {
@@ -45,6 +48,9 @@ export async function POST(request: NextRequest) {
       proxyConfig: payload.proxyConfig ? sanitizeProxyConfig(payload.proxyConfig) : undefined,
       routingPreferences: payload.routingPreferences
         ? sanitizeRoutingPreferences(payload.routingPreferences)
+        : undefined,
+      webSearchConfig: payload.webSearchConfig
+        ? sanitizeWebSearchConfig(payload.webSearchConfig)
         : undefined,
     });
     const status = await getAppStatus(username);

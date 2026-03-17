@@ -19,6 +19,7 @@ export async function POST(request: NextRequest) {
       apiKeys: executionSettings.apiKeys,
       ollamaBaseUrl: executionSettings.ollamaBaseUrl,
       proxyUrl: executionSettings.proxyUrl,
+      webSearchConfig: executionSettings.webSearchConfig,
     };
 
     const stream = new ReadableStream({

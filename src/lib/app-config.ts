@@ -32,6 +32,20 @@ export const defaultOllamaConfig: OllamaConfig = {
   baseUrl: "http://127.0.0.1:11434",
 };
 
+export type WebSearchConfig = {
+  enabled: boolean;
+  provider: "brave" | "tavily";
+  apiKey: string;
+  maxResults: number;
+};
+
+export const defaultWebSearchConfig: WebSearchConfig = {
+  enabled: false,
+  provider: "brave",
+  apiKey: "",
+  maxResults: 5,
+};
+
 export type RoutingPreferencesPayload = {
   customModels: ModelSelection[];
   debateMode: boolean;
@@ -55,6 +69,7 @@ export type AppStatusPayload = {
   routingPreferences: RoutingPreferencesPayload;
   shouldPromptForApiKeys: boolean;
   username: string | null;
+  webSearchConfig: WebSearchConfig;
 };
 
 function sanitizeModelSelection(input: unknown): ModelSelection | null {
@@ -173,6 +188,27 @@ export function sanitizeOllamaConfig(input?: Partial<OllamaConfig> | null): Olla
   return {
     enabled: Boolean(input.enabled),
     baseUrl: baseUrl || defaultOllamaConfig.baseUrl,
+  };
+}
+
+export function sanitizeWebSearchConfig(input?: Partial<WebSearchConfig> | null): WebSearchConfig {
+  if (!input) {
+    return { ...defaultWebSearchConfig };
+  }
+
+  const provider = input.provider === "brave" || input.provider === "tavily"
+    ? input.provider
+    : "brave";
+
+  const maxResults = typeof input.maxResults === "number"
+    ? Math.max(1, Math.min(10, Math.round(input.maxResults)))
+    : defaultWebSearchConfig.maxResults;
+
+  return {
+    enabled: Boolean(input.enabled),
+    provider,
+    apiKey: typeof input.apiKey === "string" ? input.apiKey : "",
+    maxResults,
   };
 }
 
