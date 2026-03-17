@@ -18,6 +18,10 @@ Choose up to 5 models, the same prompt will be fed to all models for their opini
 ### GPS Mode:
 Choose up to 5 models, he same prompt will be fed to all models for their opinions, outputs will be synthesized by synthesizer model, then answer will be give to user.
 
+## Screenshots
+<img width="960" height="479" alt="Screen Shot 2026-03-17 at 11 44 11" src="https://github.com/user-attachments/assets/3edb46ce-21d3-41fa-b006-d010ba648ab9" />
+<img width="381" height="447" alt="Screen Shot 2026-03-17 at 11 44 35" src="https://github.com/user-attachments/assets/cfb64f1f-d073-4d1f-86f1-12b9b9847d45" />
+
 
 ## Local development
 
