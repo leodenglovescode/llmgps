@@ -93,6 +93,23 @@ See [.env.example](.env.example).
 
 The container defaults to storing data in `/data/llmgps-data.sqlite`, runs as the non-root `node` user, and expects the encryption key to come from the host.
 
+### Run the pre-built image
+
+The latest image is published automatically to the GitHub Container Registry on every push to `main`:
+
+```bash
+docker run --rm -p 3000:3000 \
+	-e LLMGPS_DATA_KEY=$(openssl rand -hex 32) \
+	-v $(pwd)/llmgps-data:/data \
+	ghcr.io/leodenglovescode/llmgps:main
+```
+
+Then open http://localhost:3000.
+
+> **Note:** Generate your key once and store it somewhere safe. If you lose the key, your encrypted data cannot be recovered. You can save it to a file and use `LLMGPS_DATA_KEY_FILE` instead (see below).
+
+### Build and run locally
+
 Build and run:
 
 ```bash
