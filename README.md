@@ -10,6 +10,8 @@ llmgps is a self-hostable multi-LLM chat workspace.
 - Ollama support for local models
 - Chat history saved in encrypted SQLite
 - Next.js + React Interface
+- Inbuilt Proxy Support
+- Web Search Support 
 
 
 ### Debate Mode:
