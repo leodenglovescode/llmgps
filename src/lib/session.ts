@@ -63,12 +63,22 @@ export function verifySessionToken(token: string, secret: string) {
   }
 }
 
-export function getSessionCookieOptions() {
+export function getSessionCookieOptions(requestUrl?: string) {
+  let secure = process.env.NODE_ENV === "production";
+
+  if (secure && requestUrl) {
+    try {
+      secure = new URL(requestUrl).protocol === "https:";
+    } catch {
+      // keep default
+    }
+  }
+
   return {
     httpOnly: true,
     maxAge: SESSION_MAX_AGE_SECONDS,
     path: "/",
     sameSite: "lax" as const,
-    secure: process.env.NODE_ENV === "production",
+    secure,
   };
 }

@@ -27,7 +27,7 @@ export async function POST(request: Request) {
     const statusPayload = await getAppStatus(username);
 
     const response = NextResponse.json(statusPayload);
-    response.cookies.set(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
+    response.cookies.set(SESSION_COOKIE_NAME, token, getSessionCookieOptions(request.url));
     return response;
   } catch (error) {
     logError("auth/login", "Login error", error);
