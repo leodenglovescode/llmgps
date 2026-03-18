@@ -19,17 +19,18 @@ ENV PORT=3000
 ENV LLMGPS_CONTAINERIZED=true
 ENV LLMGPS_DATA_FILE=/data/llmgps-data.sqlite
 
-RUN mkdir -p /data && chown -R node:node /app /data
+RUN apk add --no-cache su-exec && mkdir -p /data && chown -R node:node /app /data
 
 COPY --from=builder --chown=node:node /app/.next ./.next
 COPY --from=builder --chown=node:node /app/public ./public
 COPY --from=builder --chown=node:node /app/package.json ./package.json
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
-
-USER node
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 VOLUME ["/data"]
 
 EXPOSE 3000
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["npm", "run", "start"]
