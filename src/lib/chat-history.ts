@@ -10,12 +10,21 @@ export type ConversationMessage = ChatMessage & {
   phase?: ConversationPhase;
 };
 
+export type CompressionRound = {
+  roundNumber: number;
+  originalTokenEstimate: number;
+  compressedTokenEstimate: number;
+  timestamp: string;
+};
+
 export type ConversationRecord = {
   id: string;
   title: string;
   preview: string;
   messages: ConversationMessage[];
   lastRun: GpsResponsePayload | null;
+  compressedContext: string | null;
+  compressionHistory: CompressionRound[];
   createdAt: string;
   updatedAt: string;
 };

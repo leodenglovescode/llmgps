@@ -5,11 +5,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 import {
+  defaultCompressionConfig,
   defaultOllamaConfig,
   defaultProxyConfig,
   defaultRoutingPreferences,
   defaultWebSearchConfig,
   type AppStatusPayload,
+  type CompressionConfig,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
@@ -17,6 +19,7 @@ import {
 } from "@/lib/app-config";
 import {
   buildConversationSummary,
+  type CompressionRound,
   type ConversationMessage,
   type ConversationRecord,
   type ConversationSummary,
@@ -229,6 +232,11 @@ export function LlmgpsShell() {
   const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [ollamaModelsBusy, setOllamaModelsBusy] = useState(false);
   const [ollamaModelsError, setOllamaModelsError] = useState<string | null>(null);
+  const [compressionEnabled, setCompressionEnabled] = useState<boolean>(false);
+  const [rollingContext, setRollingContext] = useState<boolean>(false);
+  const [compressionTargetTokens, setCompressionTargetTokens] = useState<number>(1500);
+  const [compressedContext, setCompressedContext] = useState<string | null>(null);
+  const [compressionHistory, setCompressionHistory] = useState<CompressionRound[]>([]);
 
   function applyRoutingPreferences(nextPreferences: RoutingPreferencesPayload) {
     setCustomModels(nextPreferences.customModels);
@@ -236,6 +244,9 @@ export function LlmgpsShell() {
     setSynthesizerModel(nextPreferences.synthesizerModel);
     setDebateMode(nextPreferences.debateMode);
     if (nextPreferences.debateMode) setGpsMode(false);
+    setCompressionEnabled(nextPreferences.compressionConfig?.enabled ?? false);
+    setRollingContext(nextPreferences.compressionConfig?.rollingContext ?? false);
+    setCompressionTargetTokens(nextPreferences.compressionConfig?.targetTokens ?? 1500);
   }
 
   function applyStatus(nextStatus: AppStatusPayload, options?: { syncRoutingPreferences?: boolean }) {
@@ -267,6 +278,8 @@ export function LlmgpsShell() {
     setProgressMsg("");
     setWebSearchResults([]);
     setThoughtsExpanded(false);
+    setCompressedContext(null);
+    setCompressionHistory([]);
   }
 
   function getPersistableMessages(nextMessages: UiMessage[]) {
@@ -290,6 +303,8 @@ export function LlmgpsShell() {
     setProgressMsg("");
     setError(null);
     setHistoryError(null);
+    setCompressedContext(conversation.compressedContext ?? null);
+    setCompressionHistory(conversation.compressionHistory ?? []);
   }
 
   async function refreshAppStatus() {
@@ -416,6 +431,8 @@ export function LlmgpsShell() {
         conversationId: nextConversationId ?? conversationId,
         lastRun: nextLastRun,
         messages: persistableMessages,
+        compressedContext,
+        compressionHistory,
       }),
     });
 
@@ -975,6 +992,12 @@ export function LlmgpsShell() {
             debateMode,
             responderModels,
             synthesizerModel,
+            compressionConfig: {
+              enabled: compressionEnabled,
+              rollingContext,
+              targetTokens: compressionTargetTokens,
+              modelContextOverrides: {},
+            },
           },
         },
         { syncRoutingPreferences: true },
@@ -1038,12 +1061,16 @@ export function LlmgpsShell() {
 
     const nextMessages = [...messages, nextUserMessage];
 
-    const payloadMessages: ChatMessage[] = nextMessages
-      .filter((message) => !message.isOpinion)
-      .map((message) => ({
-        content: message.content,
-        role: message.role,
-      }));
+    const isRollingActive = rollingContext && compressionEnabled && Boolean(compressedContext);
+
+    const payloadMessages: ChatMessage[] = isRollingActive
+      ? [{ role: "user", content: userPrompt }]
+      : nextMessages
+          .filter((message) => !message.isOpinion)
+          .map((message) => ({
+            content: message.content,
+            role: message.role,
+          }));
 
     setMessages(nextMessages);
     setDraft("");
@@ -1077,6 +1104,10 @@ export function LlmgpsShell() {
           responderModels,
           synthesizerModel,
           webSearchEnabled,
+          compressionConfig: compressionEnabled
+            ? { enabled: compressionEnabled, rollingContext, targetTokens: compressionTargetTokens, modelContextOverrides: {} }
+            : null,
+          previousCompressedContext: isRollingActive ? compressedContext : null,
         }),
       });
 
@@ -1107,10 +1138,13 @@ export function LlmgpsShell() {
         for (const line of lines) {
           if (!line.trim()) continue;
           let parsed: {
+            compressedContext?: string;
+            compressedEstimate?: number;
             content?: string;
             error?: string;
             message?: string;
             model?: string;
+            originalEstimate?: number;
             partialPayload?: GpsResponsePayload;
             payload?: GpsResponsePayload;
             phase?: "debate" | "initial";
@@ -1119,10 +1153,13 @@ export function LlmgpsShell() {
           };
           try {
             parsed = JSON.parse(line) as {
+              compressedContext?: string;
+              compressedEstimate?: number;
               content?: string;
               error?: string;
               message?: string;
               model?: string;
+              originalEstimate?: number;
               partialPayload?: GpsResponsePayload;
               payload?: GpsResponsePayload;
               phase?: "debate" | "initial";
@@ -1136,6 +1173,15 @@ export function LlmgpsShell() {
 
           if (parsed.type === "progress") {
             setProgressMsg(parsed.message || "Working...");
+          } else if (parsed.type === "compressed" && parsed.compressedContext) {
+            const newRound: CompressionRound = {
+              roundNumber: compressionHistory.length + 1,
+              originalTokenEstimate: parsed.originalEstimate ?? 0,
+              compressedTokenEstimate: parsed.compressedEstimate ?? 0,
+              timestamp: new Date().toISOString(),
+            };
+            setCompressedContext(parsed.compressedContext);
+            setCompressionHistory((prev) => [...prev, newRound]);
           } else if (parsed.type === "webSearchResults" && Array.isArray(parsed.results)) {
             setWebSearchResults(parsed.results);
           } else if (parsed.type === "result") {
@@ -1943,6 +1989,15 @@ export function LlmgpsShell() {
                       />
                       Debate Mode
                     </button>
+                    {compressionEnabled && compressedContext && (
+                      <div
+                        className="flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--surface-subtle)] px-2.5 py-1 text-xs font-medium text-emerald-500"
+                        title="Rolling compressed context is active for this conversation"
+                      >
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                        Rolling
+                      </div>
+                    )}
                     {webSearchConfig.enabled && webSearchConfig.apiKey?.trim() ? (
                       <button
                         type="button"
@@ -2316,6 +2371,107 @@ export function LlmgpsShell() {
                     </div>
                   </div>
                 )}
+              </section>
+
+              <section className="space-y-4 pb-6">
+                <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  Context Compression
+                </h3>
+
+                <div className="mt-4 space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <label className="text-sm font-medium">Enable Compression</label>
+                      <p className="mt-0.5 text-xs text-[var(--muted)]">
+                        After each debate round, compress model opinions into a concise summary before synthesis.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setCompressionEnabled((v) => !v)}
+                      className={cx(
+                        "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200",
+                        compressionEnabled ? "bg-[var(--foreground)]" : "bg-[var(--border)]",
+                      )}
+                    >
+                      <span
+                        className={cx(
+                          "inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200",
+                          compressionEnabled ? "translate-x-4" : "translate-x-0",
+                        )}
+                      />
+                    </button>
+                  </div>
+
+                  {compressionEnabled && (
+                    <>
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <label className="text-sm font-medium">Rolling Context</label>
+                          <p className="mt-0.5 text-xs text-[var(--muted)]">
+                            Use only the compressed summary as context for the next message instead of full history.
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setRollingContext((v) => !v)}
+                          className={cx(
+                            "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200",
+                            rollingContext ? "bg-[var(--foreground)]" : "bg-[var(--border)]",
+                          )}
+                        >
+                          <span
+                            className={cx(
+                              "inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200",
+                              rollingContext ? "translate-x-4" : "translate-x-0",
+                            )}
+                          />
+                        </button>
+                      </div>
+
+                      <div className="flex items-center justify-between gap-4">
+                        <div>
+                          <label className="text-sm font-medium">Target Token Budget</label>
+                          <p className="mt-0.5 text-xs text-[var(--muted)]">
+                            Approximate token target for the compressed summary (default: 1500).
+                          </p>
+                        </div>
+                        <input
+                          type="number"
+                          min={300}
+                          max={8000}
+                          step={100}
+                          value={compressionTargetTokens}
+                          onChange={(e) => setCompressionTargetTokens(Number(e.target.value))}
+                          className="w-24 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-right text-sm"
+                        />
+                      </div>
+                    </>
+                  )}
+
+                  {compressionHistory.length > 0 && (
+                    <div className="space-y-1.5 border-t border-[var(--border)] pt-3">
+                      <p className="text-xs font-medium text-[var(--muted)]">Compression history this session</p>
+                      {compressionHistory.map((round) => (
+                        <div key={round.roundNumber} className="flex items-center justify-between text-xs text-[var(--muted)]">
+                          <span>Round {round.roundNumber}</span>
+                          <span>{round.originalTokenEstimate} → {round.compressedTokenEstimate} tokens</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="flex justify-end pt-2">
+                    <button
+                      type="button"
+                      onClick={() => void saveRoutingPreferences()}
+                      disabled={settingsBusy !== null && settingsBusy !== "routing"}
+                      className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                    >
+                      {settingsBusy === "routing" ? "Saving..." : "Save compression defaults"}
+                    </button>
+                  </div>
+                </div>
               </section>
 
               <section className="space-y-4 pb-20">

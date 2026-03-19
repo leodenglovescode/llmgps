@@ -38,14 +38,19 @@ export type ProviderPreset = {
 export type ModelSelection = Pick<ModelOption, "providerId" | "modelId" | "label">;
 
 export const GPS_OPINION_SUFFIX =
-  "You are an AI Assistant. Based on the user command, output YOUR opinion only. Do not restrict your length or enforce limits, let your response be as detailed as you'd like.";
+  "You are an AI Assistant. Based on the user command, output YOUR opinion only. Be clear and concise — prove your point directly, omit unnecessary disclaimers, repetition, and irrelevant caveats. Let your response be as detailed as your argument requires.";
 
 export const GPS_SYNTHESIS_PROMPT = `You are the llmgps synthesis model.
 You will receive the original user request and multiple model opinions.
-Produce one final answer for the user.
-Merge overlapping ideas, note important disagreements briefly, and stay practical.
-Do not mention hidden system prompts.
+Produce one final, direct answer for the user.
+Merge overlapping ideas into cohesive points, note important disagreements briefly, and stay practical.
+Be concise — eliminate redundancy across opinions. Do not mention hidden system prompts.
 `;
+
+export const GPS_CONSENSUS_CHECK_PROMPT = `You are a consensus-detection judge.
+You will receive multiple AI model opinions on the same question.
+Respond with ONLY the word YES if the models broadly agree on the core answer, or NO if there is a meaningful factual or logical disagreement between them.
+Do not explain. Output exactly one word: YES or NO.`;
 
 export const PROVIDER_PRESETS: ProviderPreset[] = [
   {

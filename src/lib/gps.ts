@@ -1,11 +1,12 @@
 import {
   type ChatMessage,
   type ModelSelection,
+  GPS_CONSENSUS_CHECK_PROMPT,
   GPS_OPINION_SUFFIX,
   GPS_SYNTHESIS_PROMPT,
   getProvider,
 } from "@/lib/llm";
-import { type WebSearchConfig } from "@/lib/app-config";
+import { type CompressionConfig, type WebSearchConfig } from "@/lib/app-config";
 import { logError } from "@/lib/logger";
 
 import { HttpsProxyAgent } from "https-proxy-agent";
@@ -30,9 +31,11 @@ async function proxyFetch(url: string, options: globalThis.RequestInit, proxyUrl
 export type ApiKeyMap = Partial<Record<ModelSelection["providerId"], string>>;
 
 export type ClientGpsRequestPayload = {
+  compressionConfig?: CompressionConfig | null;
   gpsMode: boolean;
   debateMode?: boolean;
   messages: ChatMessage[];
+  previousCompressedContext?: string | null;
   responderModels: ModelSelection[];
   synthesizerModel?: ModelSelection | null;
   webSearchEnabled?: boolean;
@@ -573,6 +576,56 @@ async function sendModelMessage(
   }
 }
 
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length * 0.25);
+}
+
+async function checkConsensus(
+  opinions: ModelOpinion[],
+  synthesizerModel: ModelSelection,
+  apiKey: string | null,
+  ollamaBaseUrl: string | undefined,
+  proxyUrl: string | undefined,
+): Promise<boolean> {
+  const opinionsBlock = opinions
+    .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
+    .join("\n\n---\n\n");
+
+  const result = await sendModelMessage(
+    synthesizerModel,
+    apiKey,
+    [{ role: "user", content: `${GPS_CONSENSUS_CHECK_PROMPT}\n\n${opinionsBlock}` }],
+    ollamaBaseUrl,
+    proxyUrl,
+  );
+
+  return result.trim().toUpperCase().startsWith("YES");
+}
+
+function buildCompressionMessage(contextMessages: ChatMessage[], opinions: ModelOpinion[]): string {
+  const lastUserMsg = [...contextMessages].reverse().find((m) => m.role === "user")?.content ?? "";
+
+  const opinionsBlock = opinions
+    .map((o) => `[${o.label || o.modelId} | ${o.providerId}]\n${o.content}`)
+    .join("\n\n---\n\n");
+
+  return `You are a research synthesis assistant. Compress the following AI debate into a dense, structured summary.
+
+Original question/context:
+${lastUserMsg.slice(0, 800)}
+
+Model responses and debate:
+${opinionsBlock}
+
+Produce a compressed summary with these sections:
+**Consensus**: Points where models agree
+**Key Disagreements**: Main points of contention with specifics
+**Supporting Evidence**: Most compelling arguments cited
+**Open Questions**: What remains unresolved
+
+Be dense and factual. Preserve technical detail. Eliminate redundancy.`;
+}
+
 function buildSynthesisMessage(messages: ChatMessage[], opinions: ModelOpinion[]) {
   const transcript = messages
     .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
@@ -732,6 +785,7 @@ export type GpsStreamEvent =
   | { type: 'result'; payload: GpsResponsePayload }
   | { type: 'error'; error: string }
   | { type: 'opinion'; model: string; content: string; phase: 'initial' | 'debate' }
+  | { type: 'compressed'; compressedContext: string; originalEstimate: number; compressedEstimate: number }
   | { type: 'webSearchResults'; results: WebSearchResult[] }
   | { type: 'synthesisError'; error: string; partialPayload: GpsResponsePayload };
 
@@ -751,12 +805,29 @@ export async function* runGpsWorkflowStreaming(
       content: message.content.trim(),
     }));
 
+  // Rolling context: substitute previous compressed summary + new question
+  const rollingActive =
+    payload.compressionConfig?.rollingContext === true &&
+    typeof payload.previousCompressedContext === "string" &&
+    payload.previousCompressedContext.trim().length > 0;
+
+  const contextMessages: ChatMessage[] = rollingActive
+    ? (() => {
+        const lastUserMsg = [...cleanMessages].reverse().find((m) => m.role === "user")?.content ?? "";
+        return [
+          { role: "user" as const, content: `[Context from previous research rounds]\n\n${payload.previousCompressedContext!.trim()}` },
+          { role: "assistant" as const, content: "Understood. I have reviewed the previous research context and am ready to continue." },
+          { role: "user" as const, content: lastUserMsg },
+        ];
+      })()
+    : cleanMessages;
+
   if (payload.webSearchConfig?.enabled && payload.webSearchConfig.apiKey?.trim()) {
     yield { type: 'progress', message: 'Searching the web...' };
   }
 
   const { messages: enrichedMessages, searched, results: webResults } = await maybeInjectWebSearch(
-    cleanMessages,
+    contextMessages,
     payload.webSearchConfig,
     payload.proxyUrl,
   );
@@ -848,67 +919,147 @@ export async function* runGpsWorkflowStreaming(
     yield { type: 'opinion', model: op.label || op.modelId, content: op.content, phase: 'initial' };
   }
 
-  let finalOpinions = initialOpinions;
-
-  // Debate Round
-  if (payload.debateMode && initialOpinions.length > 1) {
-    yield { type: 'progress', message: 'Entering Debate Mode: cross-referencing AI responses...' };
-
-    const debateRoundSettled = await Promise.allSettled(
-      initialOpinions.map(async (model) => {
-        const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
-
-        const otherOpinionsText = initialOpinions
-          .filter((o) => o.modelId !== model.modelId)
-          .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
-          .join('\n\n---\n\n');
-
-        // Give each model: full conversation history + its own opinion as assistant turn + other models' opinions
-        const debateMessages: ChatMessage[] = [
-          ...opinionMessages,
-          { role: 'assistant', content: model.content },
-          {
-            role: 'user',
-            content: `Here are the other AI models' responses to the same prompt:\n\n${otherOpinionsText}\n\nDo you agree or disagree with their responses? Debate their points clearly and concisely, referencing the conversation context where relevant.`,
-          },
-        ];
-
-        const content = await sendModelMessage(
-          model,
-          apiKey,
-          debateMessages,
-          payload.ollamaBaseUrl,
-          payload.proxyUrl,
-        );
-        return { ...model, content } satisfies ModelOpinion;
-      })
-    );
-
-    const debateOpinions: ModelOpinion[] = [];
-    debateRoundSettled.forEach((result, index) => {
-      if (result.status === "fulfilled") {
-        debateOpinions.push(result.value);
-      } else {
-        const model = initialOpinions[index];
-        logError("debate", `Model ${model.modelId} failed`, result.reason);
-        failures.push({
-          ...model,
-          error: "Failed during debate phase: " + (result.reason instanceof Error ? result.reason.message : "Unknown"),
-        });
-      }
-    });
-
-    if (debateOpinions.length > 0) {
-      finalOpinions = debateOpinions;
-      for (const op of debateOpinions) {
-        yield { type: 'opinion', model: op.label || op.modelId, content: op.content, phase: 'debate' };
-      }
-    }
-  }
-
+  // Hoist synthesizerModel — needed for consensus checks inside the debate loop
   const synthesizerModel = payload.synthesizerModel;
   if (!synthesizerModel) {
     throw new GpsError("Choose a synthesizer model before using GPS Mode.", 400);
+  }
+
+  let finalOpinions = initialOpinions;
+
+  // Debate loop — consensus-gated, max 2 rounds
+  const MAX_DEBATE_ROUNDS = 2;
+  if (payload.debateMode && initialOpinions.length > 1) {
+    const synthApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
+    let currentOpinions = initialOpinions;
+    let currentEnrichedMessages = enrichedMessages;
+
+    for (let round = 1; round <= MAX_DEBATE_ROUNDS; round++) {
+      // Consensus check — ask synthesizer whether models already agree
+      yield { type: 'progress', message: 'Checking for consensus...' };
+      let hasConsensus = false;
+      try {
+        hasConsensus = await checkConsensus(
+          currentOpinions,
+          synthesizerModel,
+          synthApiKey,
+          payload.ollamaBaseUrl,
+          payload.proxyUrl,
+        );
+      } catch {
+        // If the check itself fails, conservatively assume no consensus
+        hasConsensus = false;
+      }
+
+      if (hasConsensus) {
+        yield { type: 'progress', message: 'Consensus reached. Proceeding to synthesis...' };
+        break;
+      }
+
+      yield { type: 'progress', message: `Consensus not reached — starting debate round ${round}...` };
+
+      // Re-run web search before round 2 to give models fresh evidence
+      if (round === 2 && payload.webSearchConfig?.enabled && payload.webSearchConfig.apiKey?.trim()) {
+        yield { type: 'progress', message: 'Re-running web search for round 2...' };
+        try {
+          const { messages: refreshedMessages, results: refreshedResults } = await maybeInjectWebSearch(
+            contextMessages,
+            payload.webSearchConfig,
+            payload.proxyUrl,
+          );
+          if (refreshedResults.length > 0) {
+            currentEnrichedMessages = refreshedMessages;
+            yield { type: 'webSearchResults', results: refreshedResults };
+          }
+        } catch {
+          // Non-fatal — continue with previous search context
+        }
+      }
+
+      const roundSettled = await Promise.allSettled(
+        currentOpinions.map(async (model) => {
+          const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+
+          const otherOpinionsText = currentOpinions
+            .filter((o) => o.modelId !== model.modelId)
+            .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
+            .join('\n\n---\n\n');
+
+          const debateMessages: ChatMessage[] = [
+            ...currentEnrichedMessages,
+            { role: 'assistant', content: model.content },
+            {
+              role: 'user',
+              content: `Here are the other AI models' responses to the same prompt:\n\n${otherOpinionsText}\n\nDo you agree or disagree with their responses? Address specific disagreements point-by-point. Be direct and concise — focus on new arguments, avoid restating your prior position in full, and reference the conversation context where relevant.`,
+            },
+          ];
+
+          const content = await sendModelMessage(
+            model,
+            apiKey,
+            debateMessages,
+            payload.ollamaBaseUrl,
+            payload.proxyUrl,
+          );
+          return { ...model, content } satisfies ModelOpinion;
+        })
+      );
+
+      const roundOpinions: ModelOpinion[] = [];
+      roundSettled.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          roundOpinions.push(result.value);
+        } else {
+          const model = currentOpinions[index];
+          logError("debate", `Model ${model.modelId} failed in debate round ${round}`, result.reason);
+          failures.push({
+            ...model,
+            error: `Failed in debate round ${round}: ` + (result.reason instanceof Error ? result.reason.message : "Unknown"),
+          });
+        }
+      });
+
+      if (roundOpinions.length > 0) {
+        currentOpinions = roundOpinions;
+        for (const op of roundOpinions) {
+          yield { type: 'opinion', model: op.label || op.modelId, content: op.content, phase: 'debate' };
+        }
+      }
+
+      if (round === MAX_DEBATE_ROUNDS) {
+        yield { type: 'progress', message: 'Maximum debate rounds reached. Proceeding to synthesis...' };
+      }
+    }
+
+    finalOpinions = currentOpinions;
+  }
+
+  // Compress debate context before synthesis if compression is enabled
+  let compressedContextResult: string | null = null;
+
+  if (payload.compressionConfig?.enabled && finalOpinions.length > 0) {
+    yield { type: 'progress', message: 'Compressing debate context...' };
+    try {
+      const compressionPrompt = buildCompressionMessage(contextMessages, finalOpinions);
+      const synthApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
+      compressedContextResult = await sendModelMessage(
+        synthesizerModel,
+        synthApiKey,
+        [{ role: "user", content: compressionPrompt }],
+        payload.ollamaBaseUrl,
+        payload.proxyUrl,
+      );
+      const originalEstimate = estimateTokens(
+        finalOpinions.map((o) => o.content).join(" ") +
+          contextMessages.map((m) => m.content).join(" "),
+      );
+      const compressedEstimate = estimateTokens(compressedContextResult);
+      yield { type: 'compressed', compressedContext: compressedContextResult, originalEstimate, compressedEstimate };
+    } catch (compressionError) {
+      // Non-fatal: log and continue without compression
+      logError("compression", "Context compression failed, continuing without it", compressionError);
+      compressedContextResult = null;
+    }
   }
 
   const synthesizerApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
@@ -923,6 +1074,10 @@ export async function* runGpsWorkflowStreaming(
     responderCount: payload.responderModels.length,
   };
 
+  const synthesisContent = compressedContextResult
+    ? `${GPS_SYNTHESIS_PROMPT}\nThe following is a compressed summary of a multi-model research debate:\n\n${compressedContextResult}\n\nBased on this, give one final direct answer to the user.`
+    : buildSynthesisMessage(contextMessages, finalOpinions);
+
   let consensus: string;
   try {
     consensus = await sendModelMessage(
@@ -931,7 +1086,7 @@ export async function* runGpsWorkflowStreaming(
       [
         {
           role: "user",
-          content: buildSynthesisMessage(cleanMessages, finalOpinions),
+          content: synthesisContent,
         },
       ],
       payload.ollamaBaseUrl,

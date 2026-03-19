@@ -46,7 +46,49 @@ export const defaultWebSearchConfig: WebSearchConfig = {
   maxResults: 5,
 };
 
+export type CompressionConfig = {
+  enabled: boolean;
+  rollingContext: boolean;
+  targetTokens: number;
+  modelContextOverrides: Record<string, number>;
+};
+
+export const defaultCompressionConfig: CompressionConfig = {
+  enabled: false,
+  rollingContext: false,
+  targetTokens: 1500,
+  modelContextOverrides: {},
+};
+
+export function sanitizeCompressionConfig(
+  input?: Partial<CompressionConfig> | null,
+): CompressionConfig {
+  if (!input) return { ...defaultCompressionConfig };
+
+  const targetTokens =
+    typeof input.targetTokens === "number" && input.targetTokens >= 200 && input.targetTokens <= 16000
+      ? Math.round(input.targetTokens)
+      : defaultCompressionConfig.targetTokens;
+
+  const modelContextOverrides: Record<string, number> = {};
+  if (input.modelContextOverrides && typeof input.modelContextOverrides === "object") {
+    for (const [key, value] of Object.entries(input.modelContextOverrides)) {
+      if (typeof key === "string" && key.trim() && typeof value === "number" && value >= 1000) {
+        modelContextOverrides[key.trim()] = value;
+      }
+    }
+  }
+
+  return {
+    enabled: Boolean(input.enabled),
+    rollingContext: Boolean(input.rollingContext),
+    targetTokens,
+    modelContextOverrides,
+  };
+}
+
 export type RoutingPreferencesPayload = {
+  compressionConfig: CompressionConfig;
   customModels: ModelSelection[];
   debateMode: boolean;
   responderModels: ModelSelection[];
@@ -54,6 +96,7 @@ export type RoutingPreferencesPayload = {
 };
 
 export const defaultRoutingPreferences: RoutingPreferencesPayload = {
+  compressionConfig: { ...defaultCompressionConfig },
   customModels: [],
   debateMode: false,
   responderModels: [],
@@ -141,14 +184,16 @@ export function sanitizeRoutingPreferences(
 ): RoutingPreferencesPayload {
   if (!input) {
     return {
-      ...defaultRoutingPreferences,
+      compressionConfig: { ...defaultCompressionConfig },
       customModels: [],
+      debateMode: false,
       responderModels: [],
       synthesizerModel: null,
     };
   }
 
   return {
+    compressionConfig: sanitizeCompressionConfig(input.compressionConfig),
     customModels: sanitizeModelSelectionList(input.customModels),
     debateMode: Boolean(input.debateMode),
     responderModels: sanitizeModelSelectionList(input.responderModels, 5),

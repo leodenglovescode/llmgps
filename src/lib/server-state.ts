@@ -108,6 +108,8 @@ type ConversationPayload = {
   messages: ConversationMessage[];
   preview: string;
   title: string;
+  compressedContext: ConversationRecord["compressedContext"];
+  compressionHistory: ConversationRecord["compressionHistory"];
 };
 
 type StoragePaths = {
@@ -864,8 +866,19 @@ function buildConversationPreview(messages: ConversationMessage[]) {
 
 function sanitizeConversationPayload(payload: Partial<ConversationPayload>) {
   const messages = sanitizeConversationMessages(payload.messages);
+  const compressedContext = typeof payload.compressedContext === "string" ? payload.compressedContext : null;
+  const compressionHistory = Array.isArray(payload.compressionHistory)
+    ? (payload.compressionHistory as unknown[]).filter(
+        (entry): entry is ConversationRecord["compressionHistory"][number] =>
+          typeof entry === "object" &&
+          entry !== null &&
+          typeof (entry as Record<string, unknown>).roundNumber === "number",
+      )
+    : [];
 
   return {
+    compressedContext,
+    compressionHistory,
     lastRun: sanitizeGpsResponsePayload(payload.lastRun),
     messages,
     preview: buildConversationPreview(messages),
@@ -884,6 +897,8 @@ async function hydrateConversation(row: ConversationRow): Promise<ConversationRe
     preview: payload.preview,
     messages: payload.messages,
     lastRun: payload.lastRun,
+    compressedContext: payload.compressedContext,
+    compressionHistory: payload.compressionHistory,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -908,11 +923,15 @@ export async function getConversationHistory(conversationId: string) {
 }
 
 export async function saveConversationHistory(input: {
+  compressedContext?: string | null;
+  compressionHistory?: ConversationRecord["compressionHistory"];
   conversationId?: string | null;
   lastRun?: ConversationRecord["lastRun"];
   messages: ConversationMessage[];
 }) {
   const payload = sanitizeConversationPayload({
+    compressedContext: input.compressedContext ?? null,
+    compressionHistory: input.compressionHistory ?? [],
     lastRun: input.lastRun,
     messages: input.messages,
   });
@@ -945,6 +964,8 @@ export async function saveConversationHistory(input: {
     preview: payload.preview,
     messages: payload.messages,
     lastRun: payload.lastRun,
+    compressedContext: payload.compressedContext,
+    compressionHistory: payload.compressionHistory,
     createdAt,
     updatedAt,
   } satisfies ConversationRecord;

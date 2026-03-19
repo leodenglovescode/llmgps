@@ -4,12 +4,15 @@ import {
   sanitizeConversationMessages,
   sanitizeGpsResponsePayload,
   type ConversationMessage,
+  type ConversationRecord,
 } from "@/lib/chat-history";
 import { getAuthenticatedUsername } from "@/lib/server-auth";
 import { logError } from "@/lib/logger";
 import { listConversationHistory, saveConversationHistory } from "@/lib/server-state";
 
 type SaveConversationPayload = {
+  compressedContext?: unknown;
+  compressionHistory?: unknown;
   conversationId?: string | null;
   lastRun?: unknown;
   messages?: unknown;
@@ -42,6 +45,14 @@ export async function POST(request: NextRequest) {
     }
 
     const conversation = await saveConversationHistory({
+      compressedContext: typeof payload.compressedContext === "string" ? payload.compressedContext : null,
+      compressionHistory: Array.isArray(payload.compressionHistory)
+        ? (payload.compressionHistory as unknown[]).filter(
+            (entry): entry is ConversationRecord["compressionHistory"][number] =>
+              typeof entry === "object" && entry !== null &&
+              typeof (entry as Record<string, unknown>).roundNumber === "number",
+          )
+        : [],
       conversationId: payload.conversationId,
       lastRun: sanitizeGpsResponsePayload(payload.lastRun),
       messages,
