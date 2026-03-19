@@ -142,6 +142,11 @@ docker run --rm -p 3000:3000 \
 
 Only mount `/data` persistently. Do not persist a generated key file beside the database inside the container.
 
+## Flow Chart of how the logic of "Debate Mode" works
+
+<img width="2695" height="4165" alt="mermaid-diagram-2026-03-19-141610" src="https://github.com/user-attachments/assets/c73dcae3-4625-4f86-859d-2d51ccf59dc2" />
+
+
 ## Credits
 Idea and Logic by @leodenglovescode
 Code assisted by Github Copilot
