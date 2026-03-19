@@ -25,10 +25,10 @@ llmgps is a self-hostable multi-LLM chat workspace.
 
 
 ### Debate Mode:
-Choose up to 5 models, the same prompt will be fed to all models for their opinions, outputs will be combined as one, then fed to all models (cross-reference), then each model will debate (explain who is right/wrong, and why), then the Synthesizer Model will synthesize all answers, giving users the final answer
+Choose up to 5 models. The same prompt is sent to all models simultaneously for their initial opinions. The synthesizer then checks whether the models broadly agree. If not, a debate round begins — each model reads the others' responses and refines its position point-by-point. If disagreement persists after round 1, web search re-runs to supply fresh evidence before a second round. After at most 2 rounds the synthesizer produces a single final answer. Optionally, debate context can be compressed into a rolling summary to keep later rounds within context limits.
 
 ### GPS Mode:
-Choose up to 5 models, he same prompt will be fed to all models for their opinions, outputs will be synthesized by synthesizer model, then answer will be give to user.
+Choose up to 5 models. The same prompt is sent to all models simultaneously for their initial opinions. The synthesizer model merges all responses into one cohesive final answer, noting any key disagreements.
 
 ## Screenshots
 <img width="960" height="479" alt="Screen Shot 2026-03-17 at 11 44 11" src="https://github.com/user-attachments/assets/3edb46ce-21d3-41fa-b006-d010ba648ab9" />
