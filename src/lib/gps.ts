@@ -6,7 +6,7 @@ import {
   GPS_SYNTHESIS_PROMPT,
   getProvider,
 } from "@/lib/llm";
-import { type CompressionConfig, type WebSearchConfig } from "@/lib/app-config";
+import { defaultThinkingConfig, type CompressionConfig, type ThinkingConfig, type WebSearchConfig } from "@/lib/app-config";
 import { logError } from "@/lib/logger";
 
 import { HttpsProxyAgent } from "https-proxy-agent";
@@ -40,6 +40,7 @@ export type ClientGpsRequestPayload = {
   responderModels: ModelSelection[];
   searchQueryModel?: ModelSelection | null;
   synthesizerModel?: ModelSelection | null;
+  userMemories?: string;
   webSearchEnabled?: boolean;
 };
 
@@ -49,6 +50,7 @@ export type GpsExecutionPayload = ClientGpsRequestPayload & {
   ollamaBaseUrl?: string;
   ollamaBypassProxy?: boolean;
   proxyUrl?: string;
+  thinkingConfig?: ThinkingConfig | null;
   webSearchConfig?: WebSearchConfig;
 };
 
@@ -72,6 +74,7 @@ type OpenAICompatibleResponse = {
   choices?: Array<{
     message?: {
       content?: string | Array<{ text?: string; type?: string }>;
+      reasoning_content?: string;
     };
   }>;
   error?: {
@@ -83,6 +86,7 @@ type AnthropicResponse = {
   content?: Array<{
     text?: string;
     type?: string;
+    thinking?: string;
   }>;
   error?: {
     message?: string;
@@ -94,6 +98,7 @@ type GeminiResponse = {
     content?: {
       parts?: Array<{
         text?: string;
+        thought?: boolean;
       }>;
     };
   }>;
@@ -101,6 +106,26 @@ type GeminiResponse = {
     message?: string;
   };
 };
+
+type OllamaStreamChunk = {
+  done?: boolean;
+  message?: { content?: string; thinking?: string };
+  error?: string;
+};
+
+type AnthropicSSEEvent = {
+  type: string;
+  delta?: { type: string; thinking?: string; text?: string };
+};
+
+type ThinkingResult = { content: string; thinking: string };
+
+type FanOutEvent =
+  | { kind: 'thinking'; model: string; delta: string }
+  | { kind: 'content'; model: string; delta: string }
+  | { kind: 'done'; index: number; content: string; thinking: string }
+  | { kind: 'error'; index: number; error: string }
+  | { kind: 'end' };
 
 export class GpsError extends Error {
   status: number;
@@ -674,6 +699,370 @@ async function sendModelMessage(
   }
 }
 
+// Models that do not accept temperature / sampling params
+function isReasonerModel(modelId: string) {
+  return modelId.includes("reasoner") || modelId.includes("r1") || modelId.includes("qwq");
+}
+
+type OpenAIStreamChunk = {
+  choices?: Array<{
+    delta?: {
+      content?: string | null;
+      reasoning_content?: string | null;
+    };
+    finish_reason?: string | null;
+  }>;
+  error?: { message?: string };
+};
+
+async function sendOpenAICompatibleMessageWithThinking(
+  model: ModelSelection,
+  apiKey: string,
+  messages: ChatMessage[],
+  onThinkingDelta?: (delta: string) => void,
+  onContentDelta?: (delta: string) => void,
+  proxyUrl?: string,
+  customEndpointBaseUrl?: string,
+): Promise<ThinkingResult> {
+  try {
+    const body: Record<string, unknown> = {
+      model: model.modelId,
+      messages,
+      stream: true,
+    };
+    if (!isReasonerModel(model.modelId)) {
+      body.temperature = 0.6;
+    }
+    if (model.providerId === "openrouter") {
+      // OpenRouter: ask for reasoning tokens
+      body.include_reasoning = true;
+    }
+
+    const response = await proxyFetch(getOpenAICompatibleBaseUrl(model.providerId, customEndpointBaseUrl), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        ...(model.providerId === "openrouter" ? { "HTTP-Referer": "https://llmgps.local", "X-Title": "llmgps" } : {}),
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+    }, proxyUrl);
+
+    if (!response.ok) throw new GpsError(await parseError(response), response.status);
+    if (!response.body) throw new GpsError("Provider returned no response body.", 502);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let thinkingAccumulator = "";
+    let contentAccumulator = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr || jsonStr === "[DONE]") continue;
+          try {
+            const chunk = JSON.parse(jsonStr) as OpenAIStreamChunk;
+            const delta = chunk.choices?.[0]?.delta;
+            if (delta?.reasoning_content) {
+              thinkingAccumulator += delta.reasoning_content;
+              onThinkingDelta?.(delta.reasoning_content);
+            }
+            if (delta?.content) {
+              contentAccumulator += delta.content;
+              onContentDelta?.(delta.content);
+            }
+          } catch { /* skip malformed SSE line */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const content = contentAccumulator.trim();
+    if (!content) throw new GpsError("The provider returned an empty response.", 502);
+    return { content, thinking: thinkingAccumulator.trim() };
+  } catch (error) {
+    throw normalizeProviderError(error);
+  }
+}
+
+async function sendAnthropicMessageWithThinking(
+  model: ModelSelection,
+  apiKey: string,
+  messages: ChatMessage[],
+  thinkingConfig: ThinkingConfig,
+  onThinkingDelta?: (delta: string) => void,
+  onContentDelta?: (delta: string) => void,
+  proxyUrl?: string,
+): Promise<ThinkingResult> {
+  if (!thinkingConfig.anthropicExtendedThinking) {
+    const content = await sendAnthropicMessage(model, apiKey, messages, proxyUrl);
+    return { content, thinking: "" };
+  }
+
+  try {
+    const budgetTokens = thinkingConfig.anthropicBudgetTokens;
+    const maxTokens = Math.max(budgetTokens + 4000, 16000);
+
+    const response = await proxyFetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "interleaved-thinking-2025-05-14",
+      },
+      body: JSON.stringify({
+        model: model.modelId,
+        max_tokens: maxTokens,
+        stream: true,
+        thinking: { type: "enabled", budget_tokens: budgetTokens },
+        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+      }),
+      signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+    }, proxyUrl);
+
+    if (!response.ok) throw new GpsError(await parseError(response), response.status);
+    if (!response.body) throw new GpsError("Anthropic returned no response body.", 502);
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let thinkingAccumulator = "";
+    let textAccumulator = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const jsonStr = line.slice(6).trim();
+          if (!jsonStr || jsonStr === "[DONE]") continue;
+          try {
+            const event = JSON.parse(jsonStr) as AnthropicSSEEvent;
+            if (event.type === "content_block_delta" && event.delta) {
+              if (event.delta.type === "thinking_delta" && event.delta.thinking) {
+                thinkingAccumulator += event.delta.thinking;
+                onThinkingDelta?.(event.delta.thinking);
+              } else if (event.delta.type === "text_delta" && event.delta.text) {
+                textAccumulator += event.delta.text;
+                onContentDelta?.(event.delta.text);
+              }
+            }
+          } catch { /* skip malformed SSE line */ }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const content = textAccumulator.trim();
+    if (!content) throw new GpsError("Anthropic returned an empty response.", 502);
+    return { content, thinking: thinkingAccumulator.trim() };
+  } catch (error) {
+    throw normalizeProviderError(error);
+  }
+}
+
+async function sendGeminiMessageWithThinking(
+  model: ModelSelection,
+  apiKey: string,
+  messages: ChatMessage[],
+  onThinkingDelta?: (delta: string) => void,
+  onContentDelta?: (delta: string) => void,
+  proxyUrl?: string,
+): Promise<ThinkingResult> {
+  try {
+    const response = await proxyFetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model.modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: messages.map((message) => ({
+            role: message.role === "assistant" ? "model" : "user",
+            parts: [{ text: message.content }],
+          })),
+          generationConfig: { temperature: 0.6 },
+        }),
+        signal: AbortSignal.timeout(PROVIDER_REQUEST_TIMEOUT_MS),
+      },
+      proxyUrl
+    );
+
+    if (!response.ok) throw new GpsError(await parseError(response), response.status);
+
+    const payload = (await response.json()) as GeminiResponse;
+    const allParts = payload.candidates?.[0]?.content?.parts ?? [];
+    const thinking = allParts.filter((p) => p.thought).map((p) => p.text).filter(Boolean).join("\n").trim();
+    const content = allParts.filter((p) => !p.thought).map((p) => p.text).filter(Boolean).join("\n").trim();
+
+    if (!content) throw new GpsError(payload.error?.message || "Gemini returned an empty response.", 502);
+    if (thinking) onThinkingDelta?.(thinking);
+    if (content) onContentDelta?.(content);
+    return { content, thinking };
+  } catch (error) {
+    throw normalizeProviderError(error);
+  }
+}
+
+const OLLAMA_IDLE_MS = 30_000;
+
+async function sendOllamaMessageWithThinking(
+  model: ModelSelection,
+  messages: ChatMessage[],
+  onThinkingDelta?: (delta: string) => void,
+  onContentDelta?: (delta: string) => void,
+  ollamaBaseUrl?: string,
+  proxyUrl?: string,
+): Promise<ThinkingResult> {
+  if (!ollamaBaseUrl?.trim()) {
+    throw new GpsError("Ollama is not enabled in Settings.", 400);
+  }
+
+  const normalizedBaseUrl = ollamaBaseUrl.replace(/\/$/, "");
+  const ctrl = new AbortController();
+  let idleTimer = setTimeout(() => ctrl.abort(), OLLAMA_IDLE_MS);
+
+  let response: Response;
+  try {
+    response = await proxyFetch(
+      `${normalizedBaseUrl}/api/chat`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: model.modelId, messages, stream: true }),
+        signal: ctrl.signal,
+      },
+      proxyUrl,
+    );
+  } catch (fetchError) {
+    clearTimeout(idleTimer);
+    if (fetchError instanceof Error && fetchError.name === "AbortError") {
+      throw new GpsError("Ollama model stopped responding (30s idle).", 504);
+    }
+    throw normalizeProviderError(fetchError);
+  }
+
+  if (!response.ok) {
+    clearTimeout(idleTimer);
+    throw new GpsError(await parseError(response), response.status);
+  }
+
+  if (!response.body) {
+    clearTimeout(idleTimer);
+    throw new GpsError("Ollama returned no response body.", 502);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let contentAccumulator = "";
+  let thinkingAccumulator = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      clearTimeout(idleTimer);
+      if (done) break;
+      idleTimer = setTimeout(() => ctrl.abort(), OLLAMA_IDLE_MS);
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const chunk = JSON.parse(trimmed) as OllamaStreamChunk;
+          if (chunk.message?.thinking) {
+            thinkingAccumulator += chunk.message.thinking;
+            onThinkingDelta?.(chunk.message.thinking);
+          }
+          if (chunk.message?.content) {
+            contentAccumulator += chunk.message.content;
+            onContentDelta?.(chunk.message.content);
+          }
+          if (chunk.done) break;
+        } catch { /* skip malformed NDJSON */ }
+      }
+    }
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new GpsError("Ollama model stopped responding (30s idle).", 504);
+    }
+    throw normalizeProviderError(error);
+  } finally {
+    clearTimeout(idleTimer);
+    reader.releaseLock();
+  }
+
+  const content = contentAccumulator.trim();
+  if (!content) throw new GpsError("Ollama returned an empty response.", 502);
+  return { content, thinking: thinkingAccumulator.trim() };
+}
+
+async function sendModelMessageWithThinking(
+  model: ModelSelection,
+  apiKey: string | null,
+  messages: ChatMessage[],
+  thinkingConfig: ThinkingConfig | null | undefined,
+  ollamaBaseUrl?: string,
+  proxyUrl?: string,
+  customEndpointBaseUrl?: string,
+  onThinkingDelta?: (delta: string) => void,
+  onContentDelta?: (delta: string) => void,
+): Promise<ThinkingResult> {
+  const provider = getProvider(model.providerId);
+  if (!provider) throw new GpsError(`Unknown provider: ${model.providerId}.`, 400);
+
+  const effectiveThinkingConfig = thinkingConfig ?? { ...defaultThinkingConfig };
+
+  switch (provider.requestShape) {
+    case "openai-compatible":
+      return sendOpenAICompatibleMessageWithThinking(model, apiKey || "", messages, onThinkingDelta, onContentDelta, proxyUrl, customEndpointBaseUrl);
+    case "anthropic":
+      return sendAnthropicMessageWithThinking(model, apiKey || "", messages, effectiveThinkingConfig, onThinkingDelta, onContentDelta, proxyUrl);
+    case "gemini":
+      return sendGeminiMessageWithThinking(model, apiKey || "", messages, onThinkingDelta, onContentDelta, proxyUrl);
+    case "ollama":
+      return sendOllamaMessageWithThinking(model, messages, onThinkingDelta, onContentDelta, ollamaBaseUrl, proxyUrl);
+    default:
+      throw new GpsError(`Unsupported request shape for ${provider.name}.`, 500);
+  }
+}
+
+function createFanOutQueue<T>() {
+  const items: T[] = [];
+  const listeners: Array<() => void> = [];
+
+  function push(item: T) {
+    items.push(item);
+    listeners.shift()?.();
+  }
+
+  async function next(): Promise<T | null> {
+    if (items.length > 0) return items.shift()!;
+    return new Promise<T | null>((resolve) => {
+      listeners.push(() => resolve(items.shift() ?? null));
+    });
+  }
+
+  return { push, next };
+}
+
 function estimateTokens(text: string): number {
   return Math.ceil(text.length * 0.25);
 }
@@ -700,6 +1089,52 @@ async function checkConsensus(
   );
 
   return result.trim().toUpperCase().startsWith("YES");
+}
+
+async function checkMemoryRelevance(
+  userQuery: string,
+  userMemories: string,
+  synthesizerModel: ModelSelection,
+  apiKeys: ApiKeyMap,
+  ollamaBaseUrl?: string,
+  proxyUrl?: string,
+  customEndpointBaseUrl?: string,
+): Promise<boolean> {
+  try {
+    const apiKey = apiKeys[synthesizerModel.providerId] ?? null;
+    const result = await sendModelMessage(
+      synthesizerModel,
+      apiKey,
+      [
+        {
+          role: "user" as const,
+          content: `You decide whether to inject personal background context into an AI assistant prompt.\n\nUser's saved memories:\n${userMemories}\n\nUser's current query: "${userQuery}"\n\nShould these memories be injected as context to help answer this query? Respond with YES or NO only.`,
+        },
+      ],
+      ollamaBaseUrl,
+      proxyUrl,
+      customEndpointBaseUrl,
+    );
+    return !result.trim().toUpperCase().startsWith("NO");
+  } catch {
+    return true; // fail open: always inject on error
+  }
+}
+
+function injectMemoriesIntoMessages(messages: ChatMessage[], memories: string): ChatMessage[] {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") {
+      return [
+        ...messages.slice(0, i),
+        {
+          role: "user" as const,
+          content: `[Personal context — keep in mind throughout]\n${memories}\n\n---\n\n${messages[i].content}`,
+        },
+        ...messages.slice(i + 1),
+      ];
+    }
+  }
+  return messages;
 }
 
 function buildCompressionMessage(contextMessages: ChatMessage[], opinions: ModelOpinion[]): string {
@@ -785,8 +1220,26 @@ export async function runGpsWorkflow(
       content: message.content.trim(),
     }));
 
+  const lastUserMsg = [...cleanMessages].reverse().find((m) => m.role === "user")?.content ?? "";
+  let shouldInjectMemories = Boolean(payload.userMemories?.trim());
+  if (shouldInjectMemories && payload.synthesizerModel) {
+    shouldInjectMemories = await checkMemoryRelevance(
+      lastUserMsg,
+      payload.userMemories!,
+      payload.synthesizerModel,
+      payload.apiKeys,
+      payload.ollamaBaseUrl,
+      proxyFor(payload.synthesizerModel),
+      payload.customEndpointBaseUrl,
+    );
+  }
+
+  const baseMessages = shouldInjectMemories
+    ? injectMemoriesIntoMessages(cleanMessages, payload.userMemories!)
+    : cleanMessages;
+
   const { messages: enrichedMessages } = await maybeInjectWebSearch(
-    cleanMessages,
+    baseMessages,
     payload.webSearchConfig,
     payload.proxyUrl,
     payload.searchQueryModel,
@@ -891,11 +1344,13 @@ export async function runGpsWorkflow(
   };
 }
 
-export type GpsStreamEvent = 
+export type GpsStreamEvent =
   | { type: 'progress'; message: string }
   | { type: 'result'; payload: GpsResponsePayload }
   | { type: 'error'; error: string }
   | { type: 'opinion'; model: string; content: string; phase: 'initial' | 'debate' }
+  | { type: 'thinking'; model: string; content: string }
+  | { type: 'outputPreview'; model: string; content: string }
   | { type: 'compressed'; compressedContext: string; originalEstimate: number; compressedEstimate: number }
   | { type: 'webSearchResults'; results: WebSearchResult[] }
   | { type: 'synthesisError'; error: string; partialPayload: GpsResponsePayload };
@@ -919,22 +1374,39 @@ export async function* runGpsWorkflowStreaming(
       content: message.content.trim(),
     }));
 
+  const lastUserMsg = [...cleanMessages].reverse().find((m) => m.role === "user")?.content ?? "";
+
+  let shouldInjectMemories = Boolean(payload.userMemories?.trim());
+  if (shouldInjectMemories && payload.synthesizerModel) {
+    yield { type: 'progress', message: 'Checking memory relevance...' };
+    shouldInjectMemories = await checkMemoryRelevance(
+      lastUserMsg,
+      payload.userMemories!,
+      payload.synthesizerModel,
+      payload.apiKeys,
+      payload.ollamaBaseUrl,
+      proxyFor(payload.synthesizerModel),
+      payload.customEndpointBaseUrl,
+    );
+  }
+
   // Rolling context: substitute previous compressed summary + new question
   const rollingActive =
     payload.compressionConfig?.rollingContext === true &&
     typeof payload.previousCompressedContext === "string" &&
     payload.previousCompressedContext.trim().length > 0;
 
-  const contextMessages: ChatMessage[] = rollingActive
-    ? (() => {
-        const lastUserMsg = [...cleanMessages].reverse().find((m) => m.role === "user")?.content ?? "";
-        return [
-          { role: "user" as const, content: `[Context from previous research rounds]\n\n${payload.previousCompressedContext!.trim()}` },
-          { role: "assistant" as const, content: "Understood. I have reviewed the previous research context and am ready to continue." },
-          { role: "user" as const, content: lastUserMsg },
-        ];
-      })()
-    : cleanMessages;
+  const baseMessages: ChatMessage[] = rollingActive
+    ? [
+        { role: "user" as const, content: `[Context from previous research rounds]\n\n${payload.previousCompressedContext!.trim()}` },
+        { role: "assistant" as const, content: "Understood. I have reviewed the previous research context and am ready to continue." },
+        { role: "user" as const, content: lastUserMsg },
+      ]
+    : [...cleanMessages];
+
+  const contextMessages = shouldInjectMemories
+    ? injectMemoriesIntoMessages(baseMessages, payload.userMemories!)
+    : baseMessages;
 
   if (payload.webSearchConfig?.enabled && payload.webSearchConfig.apiKey?.trim()) {
     yield { type: 'progress', message: payload.searchQueryModel
@@ -1006,43 +1478,56 @@ export async function* runGpsWorkflowStreaming(
   const initialOpinions: ModelOpinion[] = [];
   const failures: ModelFailure[] = [];
 
-  // First Round
-  const firstRoundSettled = await Promise.allSettled(
-    payload.responderModels.map(async (model) => {
-      const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
-      const content = await sendModelMessage(
-        model,
-        apiKey,
-        opinionMessages,
-        payload.ollamaBaseUrl,
-        proxyFor(model),
-        payload.customEndpointBaseUrl,
-      );
-      return { ...model, content } satisfies ModelOpinion;
-    }),
-  );
+  // First Round — fan-out queue for live thinking + opinions
+  {
+    const queue = createFanOutQueue<FanOutEvent>();
+    let pending = payload.responderModels.length;
 
-  firstRoundSettled.forEach((result, index) => {
-    if (result.status === "fulfilled") {
-      initialOpinions.push(result.value);
-    } else {
-      const model = payload.responderModels[index];
-      failures.push({
-        ...model,
-        error: result.reason instanceof Error ? result.reason.message : "The provider request failed.",
-      });
+    payload.responderModels.forEach((model, index) => {
+      const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+      const label = model.label || model.modelId;
+      void (async () => {
+        try {
+          const result = await sendModelMessageWithThinking(
+            model, apiKey, opinionMessages,
+            payload.thinkingConfig,
+            payload.ollamaBaseUrl, proxyFor(model), payload.customEndpointBaseUrl,
+            (delta) => queue.push({ kind: 'thinking', model: label, delta }),
+            (delta) => queue.push({ kind: 'content', model: label, delta }),
+          );
+          queue.push({ kind: 'done', index, content: result.content, thinking: result.thinking });
+        } catch (err) {
+          queue.push({ kind: 'error', index, error: err instanceof Error ? err.message : "Provider request failed." });
+        } finally {
+          pending--;
+          if (pending === 0) queue.push({ kind: 'end' });
+        }
+      })();
+    });
+
+    while (true) {
+      const event = await queue.next();
+      if (!event || event.kind === 'end') break;
+      if (event.kind === 'thinking') {
+        yield { type: 'thinking', model: event.model, content: event.delta };
+      } else if (event.kind === 'content') {
+        yield { type: 'outputPreview', model: event.model, content: event.delta };
+      } else if (event.kind === 'done') {
+        const model = payload.responderModels[event.index];
+        initialOpinions.push({ ...model, content: event.content });
+        yield { type: 'opinion', model: model.label || model.modelId, content: event.content, phase: 'initial' };
+      } else if (event.kind === 'error') {
+        const model = payload.responderModels[event.index];
+        failures.push({ ...model, error: event.error });
+      }
     }
-  });
+  }
 
   if (initialOpinions.length === 0) {
     throw new GpsError(
       failures[0]?.error || "All responder models failed to produce an answer.",
       502,
     );
-  }
-
-  for (const op of initialOpinions) {
-    yield { type: 'opinion', model: op.label || op.modelId, content: op.content, phase: 'initial' };
   }
 
   // Hoist synthesizerModel — needed for consensus checks inside the debate loop
@@ -1107,15 +1592,18 @@ export async function* runGpsWorkflowStreaming(
         }
       }
 
-      const roundSettled = await Promise.allSettled(
-        currentOpinions.map(async (model) => {
-          const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+      const roundOpinions: ModelOpinion[] = [];
+      {
+        const queue = createFanOutQueue<FanOutEvent>();
+        let pending = currentOpinions.length;
 
+        currentOpinions.forEach((model, index) => {
+          const apiKey = getRequiredProviderSecret(model, payload.apiKeys);
+          const label = model.label || model.modelId;
           const otherOpinionsText = currentOpinions
             .filter((o) => o.modelId !== model.modelId)
             .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
             .join('\n\n---\n\n');
-
           const debateMessages: ChatMessage[] = [
             ...currentEnrichedMessages,
             { role: 'assistant', content: model.content },
@@ -1124,38 +1612,46 @@ export async function* runGpsWorkflowStreaming(
               content: `Here are the other AI models' responses to the same prompt:\n\n${otherOpinionsText}\n\nDo you agree or disagree with their responses? Address specific disagreements point-by-point. Be direct and concise — focus on new arguments, avoid restating your prior position in full, and reference the conversation context where relevant.`,
             },
           ];
+          void (async () => {
+            try {
+              const result = await sendModelMessageWithThinking(
+                model, apiKey, debateMessages,
+                payload.thinkingConfig,
+                payload.ollamaBaseUrl, proxyFor(model), payload.customEndpointBaseUrl,
+                (delta) => queue.push({ kind: 'thinking', model: label, delta }),
+                (delta) => queue.push({ kind: 'content', model: label, delta }),
+              );
+              queue.push({ kind: 'done', index, content: result.content, thinking: result.thinking });
+            } catch (err) {
+              queue.push({ kind: 'error', index, error: err instanceof Error ? err.message : "Provider request failed." });
+            } finally {
+              pending--;
+              if (pending === 0) queue.push({ kind: 'end' });
+            }
+          })();
+        });
 
-          const content = await sendModelMessage(
-            model,
-            apiKey,
-            debateMessages,
-            payload.ollamaBaseUrl,
-            proxyFor(model),
-            payload.customEndpointBaseUrl,
-          );
-          return { ...model, content } satisfies ModelOpinion;
-        })
-      );
-
-      const roundOpinions: ModelOpinion[] = [];
-      roundSettled.forEach((result, index) => {
-        if (result.status === "fulfilled") {
-          roundOpinions.push(result.value);
-        } else {
-          const model = currentOpinions[index];
-          logError("debate", `Model ${model.modelId} failed in debate round ${round}`, result.reason);
-          failures.push({
-            ...model,
-            error: `Failed in debate round ${round}: ` + (result.reason instanceof Error ? result.reason.message : "Unknown"),
-          });
+        while (true) {
+          const event = await queue.next();
+          if (!event || event.kind === 'end') break;
+          if (event.kind === 'thinking') {
+            yield { type: 'thinking', model: event.model, content: event.delta };
+          } else if (event.kind === 'content') {
+            yield { type: 'outputPreview', model: event.model, content: event.delta };
+          } else if (event.kind === 'done') {
+            const model = currentOpinions[event.index];
+            roundOpinions.push({ ...model, content: event.content });
+            yield { type: 'opinion', model: model.label || model.modelId, content: event.content, phase: 'debate' };
+          } else if (event.kind === 'error') {
+            const model = currentOpinions[event.index];
+            logError("debate", `Model ${model.modelId} failed in debate round ${round}`, event.error);
+            failures.push({ ...model, error: `Failed in debate round ${round}: ${event.error}` });
+          }
         }
-      });
+      }
 
       if (roundOpinions.length > 0) {
         currentOpinions = roundOpinions;
-        for (const op of roundOpinions) {
-          yield { type: 'opinion', model: op.label || op.modelId, content: op.content, phase: 'debate' };
-        }
       }
 
       if (round === MAX_DEBATE_ROUNDS) {

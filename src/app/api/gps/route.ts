@@ -22,6 +22,7 @@ export async function POST(request: NextRequest) {
       ollamaBaseUrl: executionSettings.ollamaBaseUrl,
       ollamaBypassProxy: executionSettings.ollamaBypassProxy,
       proxyUrl: executionSettings.proxyUrl,
+      thinkingConfig: executionSettings.thinkingConfig ?? null,
       webSearchConfig: executionSettings.webSearchConfig
         ? { ...executionSettings.webSearchConfig, enabled: payload.webSearchEnabled ?? executionSettings.webSearchConfig.enabled }
         : undefined,

@@ -53,6 +53,40 @@ export type CustomEndpointConfig = {
   baseUrl: string;
 };
 
+export type UserMemory = {
+  id: string;
+  text: string;
+};
+
+export type UserMemoriesConfig = {
+  enabled: boolean;
+  memories: UserMemory[];
+};
+
+export const defaultUserMemoriesConfig: UserMemoriesConfig = {
+  enabled: true,
+  memories: [],
+};
+
+export function sanitizeUserMemoriesConfig(input?: Partial<UserMemoriesConfig> | null): UserMemoriesConfig {
+  if (!input) return { ...defaultUserMemoriesConfig };
+
+  const rawMemories = Array.isArray(input.memories) ? input.memories : [];
+  const memories: UserMemory[] = rawMemories
+    .filter((m): m is UserMemory => m && typeof m.id === "string" && typeof m.text === "string")
+    .map((m) => ({
+      id: m.id.trim(),
+      text: m.text.trim().split(/\s+/).slice(0, 160).join(" "),
+    }))
+    .filter((m) => m.id && m.text)
+    .slice(0, 20);
+
+  return {
+    enabled: Boolean(input.enabled ?? true),
+    memories,
+  };
+}
+
 export const defaultCustomEndpointConfig: CustomEndpointConfig = {
   baseUrl: "",
 };
@@ -125,6 +159,30 @@ export const defaultRoutingPreferences: RoutingPreferencesPayload = {
   synthesizerModel: null,
 };
 
+export type ThinkingConfig = {
+  anthropicExtendedThinking: boolean;
+  anthropicBudgetTokens: number;
+};
+
+export const defaultThinkingConfig: ThinkingConfig = {
+  anthropicExtendedThinking: false,
+  anthropicBudgetTokens: 8000,
+};
+
+export function sanitizeThinkingConfig(input?: Partial<ThinkingConfig> | null): ThinkingConfig {
+  if (!input) return { ...defaultThinkingConfig };
+  const budget =
+    typeof input.anthropicBudgetTokens === "number" &&
+    input.anthropicBudgetTokens >= 1000 &&
+    input.anthropicBudgetTokens <= 32000
+      ? Math.round(input.anthropicBudgetTokens)
+      : defaultThinkingConfig.anthropicBudgetTokens;
+  return {
+    anthropicExtendedThinking: Boolean(input.anthropicExtendedThinking),
+    anthropicBudgetTokens: budget,
+  };
+}
+
 export type AppStatusPayload = {
   authenticated: boolean;
   configuredProviders: ProviderId[];
@@ -135,6 +193,8 @@ export type AppStatusPayload = {
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
   shouldPromptForApiKeys: boolean;
+  thinkingConfig: ThinkingConfig;
+  userMemories: UserMemoriesConfig;
   username: string | null;
   webSearchConfig: WebSearchConfig;
 };

@@ -8,6 +8,7 @@ export type ConversationMessage = ChatMessage & {
   isOpinion?: boolean;
   modelLabel?: string;
   phase?: ConversationPhase;
+  thinking?: string;
 };
 
 export type CompressionRound = {
@@ -121,6 +122,7 @@ export function sanitizeConversationMessage(input: unknown): ConversationMessage
     isOpinion: Boolean(candidate.isOpinion),
     modelLabel: modelLabel || undefined,
     phase: candidate.phase === "initial" || candidate.phase === "debate" ? candidate.phase : undefined,
+    thinking: typeof candidate.thinking === "string" && candidate.thinking ? candidate.thinking : undefined,
   };
 }
 

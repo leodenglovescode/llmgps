@@ -19,12 +19,16 @@ import {
   defaultOllamaConfig,
   defaultRoutingPreferences,
   defaultProxyConfig,
+  defaultThinkingConfig,
+  defaultUserMemoriesConfig,
   defaultWebSearchConfig,
   sanitizeCustomEndpointConfig,
   sanitizeLanguage,
   sanitizeOllamaConfig,
   sanitizeRoutingPreferences,
   sanitizeProxyConfig,
+  sanitizeThinkingConfig,
+  sanitizeUserMemoriesConfig,
   sanitizeWebSearchConfig,
   type AppStatusPayload,
   type CustomEndpointConfig,
@@ -32,6 +36,8 @@ import {
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type ThinkingConfig,
+  type UserMemoriesConfig,
   type WebSearchConfig,
 } from "@/lib/app-config";
 import {
@@ -58,6 +64,8 @@ type OwnerRecord = {
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
   shouldPromptForApiKeys: boolean;
+  thinkingConfig: ThinkingConfig;
+  userMemories: UserMemoriesConfig;
   username: string;
   webSearchConfig: WebSearchConfig;
 };
@@ -75,6 +83,8 @@ type OwnerSecrets = {
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
   sessionSecret: string;
+  thinkingConfig: ThinkingConfig;
+  userMemories?: UserMemoriesConfig;
   webSearchConfig: WebSearchConfig;
 };
 
@@ -104,6 +114,8 @@ type SettingsUpdate = {
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
+  thinkingConfig?: Partial<ThinkingConfig>;
+  userMemories?: Partial<UserMemoriesConfig>;
   webSearchConfig?: Partial<WebSearchConfig>;
 };
 
@@ -423,6 +435,8 @@ async function encryptSecrets(secrets: OwnerSecrets) {
     proxyConfig: sanitizeProxyConfig(secrets.proxyConfig),
     routingPreferences: sanitizeRoutingPreferences(secrets.routingPreferences),
     sessionSecret: secrets.sessionSecret,
+    thinkingConfig: sanitizeThinkingConfig(secrets.thinkingConfig),
+    userMemories: sanitizeUserMemoriesConfig(secrets.userMemories),
     webSearchConfig: sanitizeWebSearchConfig(secrets.webSearchConfig),
   } satisfies OwnerSecrets;
 
@@ -463,6 +477,8 @@ async function decryptSecrets(rawEnvelope: string): Promise<OwnerSecrets> {
       typeof payload.sessionSecret === "string" && payload.sessionSecret.trim()
         ? payload.sessionSecret
         : randomBytes(32).toString("hex"),
+    thinkingConfig: sanitizeThinkingConfig(payload.thinkingConfig),
+    userMemories: sanitizeUserMemoriesConfig(payload.userMemories),
     webSearchConfig: sanitizeWebSearchConfig(payload.webSearchConfig),
   };
 }
@@ -534,6 +550,8 @@ async function readLegacyStore(legacyJsonPath: string) {
             },
             shouldPromptForApiKeys: Boolean(parsed.owner.shouldPromptForApiKeys),
             username: parsed.owner.username?.trim() ?? "",
+            thinkingConfig: { ...defaultThinkingConfig },
+            userMemories: { ...defaultUserMemoriesConfig },
             webSearchConfig: { ...defaultWebSearchConfig },
           }
         : null,
@@ -577,6 +595,7 @@ async function migrateLegacyJsonStore(database: DatabaseSync, legacyJsonPath: st
     proxyConfig: legacyOwner.proxyConfig,
     routingPreferences: defaultRoutingPreferences,
     sessionSecret: legacyStore.sessionSecret,
+    thinkingConfig: { ...defaultThinkingConfig },
     webSearchConfig: defaultWebSearchConfig,
   });
   const now = new Date().toISOString();
@@ -632,6 +651,8 @@ async function readStore() {
       proxyConfig: sanitizeProxyConfig(secrets.proxyConfig),
       routingPreferences: sanitizeRoutingPreferences(secrets.routingPreferences),
       shouldPromptForApiKeys: Boolean(row.should_prompt_for_api_keys),
+      thinkingConfig: sanitizeThinkingConfig(secrets.thinkingConfig),
+      userMemories: sanitizeUserMemoriesConfig(secrets.userMemories),
       username: row.username,
       webSearchConfig: sanitizeWebSearchConfig(secrets.webSearchConfig),
     },
@@ -649,6 +670,8 @@ async function writeOwner(owner: OwnerRecord, sessionSecret: string) {
     proxyConfig: owner.proxyConfig,
     routingPreferences: owner.routingPreferences,
     sessionSecret,
+    thinkingConfig: owner.thinkingConfig,
+    userMemories: owner.userMemories,
     webSearchConfig: owner.webSearchConfig,
   });
   const now = new Date().toISOString();
@@ -707,6 +730,8 @@ export async function getAppStatus(username: string | null): Promise<AppStatusPa
       ? owner?.routingPreferences ?? defaultRoutingPreferences
       : defaultRoutingPreferences,
     shouldPromptForApiKeys: authenticated ? Boolean(owner?.shouldPromptForApiKeys) : false,
+    thinkingConfig: authenticated ? owner?.thinkingConfig ?? { ...defaultThinkingConfig } : { ...defaultThinkingConfig },
+    userMemories: authenticated ? owner?.userMemories ?? { ...defaultUserMemoriesConfig } : { ...defaultUserMemoriesConfig },
     username: authenticated ? owner?.username ?? null : null,
     webSearchConfig: authenticated ? owner?.webSearchConfig ?? { ...defaultWebSearchConfig } : { ...defaultWebSearchConfig },
   };
@@ -735,6 +760,8 @@ export async function initializeOwner(username: string, password: string) {
       proxyConfig: { ...defaultProxyConfig },
       routingPreferences: { ...defaultRoutingPreferences },
       shouldPromptForApiKeys: true,
+      thinkingConfig: { ...defaultThinkingConfig },
+      userMemories: { ...defaultUserMemoriesConfig },
       username: normalizedUsername,
       webSearchConfig: { ...defaultWebSearchConfig },
     },
@@ -822,6 +849,14 @@ export async function saveOwnerSettings(update: SettingsUpdate) {
     owner.customEndpointConfig = sanitizeCustomEndpointConfig(update.customEndpointConfig);
   }
 
+  if (update.userMemories !== undefined) {
+    owner.userMemories = sanitizeUserMemoriesConfig(update.userMemories);
+  }
+
+  if (update.thinkingConfig !== undefined) {
+    owner.thinkingConfig = sanitizeThinkingConfig({ ...owner.thinkingConfig, ...update.thinkingConfig });
+  }
+
   await writeOwner(owner, store.sessionSecret);
 
   return {
@@ -858,6 +893,7 @@ export async function getExecutionSettings() {
       : undefined,
     ollamaBypassProxy: store.owner.ollamaConfig.bypassProxy,
     proxyUrl: buildProxyUrl(store.owner.proxyConfig),
+    thinkingConfig: store.owner.thinkingConfig,
     webSearchConfig: store.owner.webSearchConfig,
   };
 }

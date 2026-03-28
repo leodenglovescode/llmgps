@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useEffect, useEffectEvent, useMemo, useState } from "react";
+import { type FormEvent, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -10,6 +10,8 @@ import {
   defaultOllamaConfig,
   defaultProxyConfig,
   defaultRoutingPreferences,
+  defaultThinkingConfig,
+  defaultUserMemoriesConfig,
   defaultWebSearchConfig,
   type AppStatusPayload,
   type CompressionConfig,
@@ -18,6 +20,9 @@ import {
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type ThinkingConfig,
+  type UserMemoriesConfig,
+  type UserMemory,
   type WebSearchConfig,
 } from "@/lib/app-config";
 import { en, zh, resolveLocale, type Locale } from "@/lib/locales";
@@ -95,7 +100,9 @@ const initialStatus: AppStatusPayload = {
   proxyConfig: defaultProxyConfig,
   routingPreferences: defaultRoutingPreferences,
   shouldPromptForApiKeys: false,
+  thinkingConfig: defaultThinkingConfig,
   username: null,
+  userMemories: defaultUserMemoriesConfig,
   webSearchConfig: defaultWebSearchConfig,
 };
 
@@ -190,6 +197,64 @@ function buildWelcomePrompts(date: Date, username: string | null, t: Locale) {
   return prompts;
 }
 
+function ThinkingStream({ modelName, text }: { modelName: string; text: string }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text]);
+  return (
+    <div className="mt-1 max-w-[85%] rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-subtle)] px-3 py-2 text-xs text-[var(--muted)]">
+      <div className="mb-1 flex items-center gap-1.5">
+        <span className="font-semibold">{modelName}</span>
+        <span className="italic opacity-60">reasoning...</span>
+      </div>
+      <div ref={scrollRef} className="max-h-24 overflow-y-auto">
+        <pre className="whitespace-pre-wrap break-words text-[10px] leading-relaxed opacity-70">{text}</pre>
+      </div>
+    </div>
+  );
+}
+
+function OutputPreviewStream({ modelName, text }: { modelName: string; text: string }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [text]);
+  return (
+    <div className="mt-1 max-w-[85%] rounded-xl border border-[var(--border)] bg-[var(--surface-color)] px-3 py-2 text-xs text-[var(--muted)]">
+      <div className="mb-1 flex items-center gap-1.5">
+        <span className="font-semibold">{modelName}</span>
+        <span className="italic opacity-60">responding...</span>
+      </div>
+      <div ref={scrollRef} className="max-h-24 overflow-y-auto">
+        <pre className="whitespace-pre-wrap break-words text-[10px] leading-relaxed opacity-80">{text}</pre>
+      </div>
+    </div>
+  );
+}
+
+function ThinkingDisclosure({ thinking }: { thinking: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="text-[10px] text-[var(--muted)] underline opacity-60 hover:opacity-100"
+      >
+        {open ? "Hide reasoning" : "Show reasoning"}
+      </button>
+      {open && (
+        <pre className="mt-1 max-h-48 overflow-y-auto whitespace-pre-wrap break-words text-[10px] text-[var(--muted)] opacity-80">
+          {thinking}
+        </pre>
+      )}
+    </div>
+  );
+}
+
 export function LlmgpsShell() {
   const [theme, setTheme] = useState<ThemeMode>("dark");
   const [language, setLanguage] = useState<Language>("auto");
@@ -215,6 +280,8 @@ export function LlmgpsShell() {
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>(defaultProxyConfig);
   const [webSearchConfig, setWebSearchConfig] = useState<WebSearchConfig>(defaultWebSearchConfig);
   const [customEndpointConfig, setCustomEndpointConfig] = useState<CustomEndpointConfig>(defaultCustomEndpointConfig);
+  const [userMemoriesConfig, setUserMemoriesConfig] = useState<UserMemoriesConfig>(defaultUserMemoriesConfig);
+  const [memoryDraft, setMemoryDraft] = useState("");
   const [debateMode, setDebateMode] = useState<boolean>(false);
   const [progressMsg, setProgressMsg] = useState<string>("");
   const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
@@ -256,6 +323,14 @@ export function LlmgpsShell() {
   const [compressionTargetTokens, setCompressionTargetTokens] = useState<number>(1500);
   const [compressedContext, setCompressedContext] = useState<string | null>(null);
   const [compressionHistory, setCompressionHistory] = useState<CompressionRound[]>([]);
+  const [thinkingConfig, setThinkingConfig] = useState<ThinkingConfig>({ ...defaultThinkingConfig });
+  const [thinkingInProgress, setThinkingInProgress] = useState<Map<string, string>>(new Map());
+  const thinkingInProgressRef = useRef<Map<string, string>>(new Map());
+  const activeThinkingModelsRef = useRef<Set<string>>(new Set());
+  const [outputPreviewInProgress, setOutputPreviewInProgress] = useState<Map<string, string>>(new Map());
+  const outputPreviewBufferRef = useRef<Map<string, string>>(new Map());
+  const outputPreviewFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   function applyRoutingPreferences(nextPreferences: RoutingPreferencesPayload) {
     setCustomModels(nextPreferences.customModels);
@@ -279,6 +354,8 @@ export function LlmgpsShell() {
     setProxyConfig(nextStatus.authenticated ? nextStatus.proxyConfig : { ...defaultProxyConfig });
     setWebSearchConfig(nextStatus.authenticated ? nextStatus.webSearchConfig : { ...defaultWebSearchConfig });
     setCustomEndpointConfig(nextStatus.authenticated ? nextStatus.customEndpointConfig : { ...defaultCustomEndpointConfig });
+    setUserMemoriesConfig(nextStatus.authenticated ? nextStatus.userMemories : { ...defaultUserMemoriesConfig });
+    setThinkingConfig(nextStatus.authenticated ? nextStatus.thinkingConfig ?? { ...defaultThinkingConfig } : { ...defaultThinkingConfig });
     if (nextStatus.authenticated && nextStatus.webSearchConfig.apiKey?.trim()) {
       setWebSearchEnabled(nextStatus.webSearchConfig.enabled);
     } else {
@@ -305,6 +382,14 @@ export function LlmgpsShell() {
     setThoughtsExpanded(false);
     setCompressedContext(null);
     setCompressionHistory([]);
+    setThinkingInProgress(new Map());
+    thinkingInProgressRef.current = new Map();
+    activeThinkingModelsRef.current = new Set();
+    setOutputPreviewInProgress(new Map());
+    outputPreviewBufferRef.current = new Map();
+    if (outputPreviewFlushTimerRef.current) clearTimeout(outputPreviewFlushTimerRef.current);
+    outputPreviewFlushTimerRef.current = null;
+    abortControllerRef.current = null;
   }
 
   function getPersistableMessages(nextMessages: UiMessage[]) {
@@ -351,6 +436,8 @@ export function LlmgpsShell() {
     ollamaConfig?: OllamaConfig;
     proxyConfig?: ProxyConfig;
     routingPreferences?: RoutingPreferencesPayload;
+    thinkingConfig?: ThinkingConfig;
+    userMemories?: UserMemoriesConfig;
     webSearchConfig?: WebSearchConfig;
   }, options?: { syncRoutingPreferences?: boolean }) {
     const response = await fetch("/api/settings", {
@@ -1039,6 +1126,37 @@ export function LlmgpsShell() {
     }
   }
 
+  async function saveMemoriesSettings() {
+    setSettingsBusy("memories");
+    setSettingsNotice(null);
+    setError(null);
+
+    try {
+      await saveSettings({ userMemories: userMemoriesConfig });
+      setSettingsNotice("Memories saved.");
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Unable to save memories.",
+      );
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
+  async function saveThinkingSettings() {
+    setSettingsBusy("thinking");
+    setSettingsNotice(null);
+    setError(null);
+    try {
+      await saveSettings({ thinkingConfig });
+      setSettingsNotice("Thinking settings saved.");
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Unable to save thinking settings.");
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
   async function saveRoutingPreferences() {
     setSettingsBusy("routing");
     setSettingsNotice(null);
@@ -1174,8 +1292,11 @@ export function LlmgpsShell() {
       }
 
       setProgressMsg("Preparing request...");
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
       const response = await fetch("/api/gps", {
         method: "POST",
+        signal: abortController.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           debateMode,
@@ -1190,6 +1311,9 @@ export function LlmgpsShell() {
             ? { enabled: compressionEnabled, rollingContext, targetTokens: compressionTargetTokens, modelContextOverrides: {} }
             : null,
           previousCompressedContext: isRollingActive ? compressedContext : null,
+          userMemories: userMemoriesConfig.enabled && userMemoriesConfig.memories.length > 0
+            ? userMemoriesConfig.memories.map((m) => `- ${m.text}`).join("\n")
+            : undefined,
         }),
       });
 
@@ -1231,29 +1355,59 @@ export function LlmgpsShell() {
             payload?: GpsResponsePayload;
             phase?: "debate" | "initial";
             results?: WebSearchResultItem[];
+            thinking?: string;
             type?: string;
           };
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          type ParsedShape = typeof parsed;
           try {
-            parsed = JSON.parse(line) as {
-              compressedContext?: string;
-              compressedEstimate?: number;
-              content?: string;
-              error?: string;
-              message?: string;
-              model?: string;
-              originalEstimate?: number;
-              partialPayload?: GpsResponsePayload;
-              payload?: GpsResponsePayload;
-              phase?: "debate" | "initial";
-              results?: WebSearchResultItem[];
-              type?: string;
-            };
+            parsed = JSON.parse(line) as ParsedShape;
           } catch (parseError) {
             console.error("Failed to parse stream line:", line, parseError);
             continue;
           }
 
-          if (parsed.type === "progress") {
+          if (parsed.type === "thinking" && parsed.model && parsed.content) {
+            const thinkingModel = parsed.model;
+            const thinkingDelta = parsed.content;
+
+            // Track active thinking models for accurate progress message
+            activeThinkingModelsRef.current.add(thinkingModel);
+            const activeCount = activeThinkingModelsRef.current.size;
+            setProgressMsg(
+              activeCount > 1
+                ? `${activeCount} models reasoning...`
+                : `${thinkingModel} is reasoning...`,
+            );
+
+            // Update state directly (no debounce) so fast providers show thinking immediately
+            setThinkingInProgress((cur) => {
+              const next = new Map(cur);
+              next.set(thinkingModel, (next.get(thinkingModel) ?? "") + thinkingDelta);
+              thinkingInProgressRef.current = next;
+              return next;
+            });
+          } else if (parsed.type === "outputPreview" && parsed.model && parsed.content) {
+            const previewModel = parsed.model;
+            const previewDelta = parsed.content;
+            const buf = outputPreviewBufferRef.current;
+            buf.set(previewModel, (buf.get(previewModel) ?? "") + previewDelta);
+            if (!outputPreviewFlushTimerRef.current) {
+              outputPreviewFlushTimerRef.current = setTimeout(() => {
+                outputPreviewFlushTimerRef.current = null;
+                const pending = outputPreviewBufferRef.current;
+                outputPreviewBufferRef.current = new Map();
+                if (pending.size === 0) return;
+                setOutputPreviewInProgress((cur) => {
+                  const next = new Map(cur);
+                  for (const [model, delta] of pending) {
+                    next.set(model, (next.get(model) ?? "") + delta);
+                  }
+                  return next;
+                });
+              }, 40);
+            }
+          } else if (parsed.type === "progress") {
             setProgressMsg(parsed.message || "Working...");
           } else if (parsed.type === "compressed" && parsed.compressedContext) {
             const newRound: CompressionRound = {
@@ -1272,6 +1426,23 @@ export function LlmgpsShell() {
             const opinionContent = parsed.content;
             const opinionModel = parsed.model;
             const opinionPhase = parsed.phase;
+            activeThinkingModelsRef.current.delete(opinionModel);
+            // Clear output preview for this model
+            outputPreviewBufferRef.current.delete(opinionModel);
+            setOutputPreviewInProgress((cur) => {
+              if (!cur.has(opinionModel)) return cur;
+              const next = new Map(cur);
+              next.delete(opinionModel);
+              return next;
+            });
+            // Read accumulated thinking directly from ref (always up-to-date, no pending buffer)
+            const accumulatedThinking = thinkingInProgressRef.current.get(opinionModel) ?? "";
+            setThinkingInProgress((cur) => {
+              const next = new Map(cur);
+              next.delete(opinionModel);
+              thinkingInProgressRef.current = next;
+              return next;
+            });
             const opinionMessage: UiMessage = {
               id: makeId(),
               role: "assistant",
@@ -1279,6 +1450,7 @@ export function LlmgpsShell() {
               isOpinion: true,
               modelLabel: opinionModel,
               phase: opinionPhase,
+              thinking: accumulatedThinking || undefined,
             };
             workingMessages = [...workingMessages, opinionMessage];
             setMessages(workingMessages);
@@ -1331,13 +1503,23 @@ export function LlmgpsShell() {
         );
       }
     } catch (requestError) {
-      setError(
-        requestError instanceof Error ? requestError.message : "Unable to complete the llmgps run.",
-      );
-      setProgressMsg("");
+      if (requestError instanceof Error && requestError.name === "AbortError") {
+        // User stopped generation — clear progress silently
+        setProgressMsg("");
+      } else {
+        setError(
+          requestError instanceof Error ? requestError.message : "Unable to complete the llmgps run.",
+        );
+        setProgressMsg("");
+      }
     } finally {
+      abortControllerRef.current = null;
       setBusy(false);
     }
+  }
+
+  function stopGeneration() {
+    abortControllerRef.current?.abort();
   }
 
   async function retrySynthesis() {
@@ -1813,8 +1995,11 @@ export function LlmgpsShell() {
                               )}
                             >
                               <span className="shrink-0 font-semibold text-[var(--muted)]">{op.modelLabel}</span>
-                              <span className="truncate italic text-[var(--muted)] opacity-80">
-                                {op.content.split("\n")[0].replace(/[*#`]/g, "")}
+                              <span className="flex-1 min-w-0">
+                                <span className="block truncate italic text-[var(--muted)] opacity-80">
+                                  {op.content.split("\n")[0].replace(/[*#`]/g, "")}
+                                </span>
+                                {op.thinking ? <ThinkingDisclosure thinking={op.thinking} /> : null}
                               </span>
                               <button
                                 type="button"
@@ -1996,6 +2181,12 @@ export function LlmgpsShell() {
                   <div className="max-w-[85%] rounded-2xl border border-[var(--border)] bg-[var(--surface-color)] px-4 py-3 text-[15px]">
                     <p className="animate-pulse">{progressMsg || "Working..."}</p>
                   </div>
+                  {thinkingInProgress.size > 0 && Array.from(thinkingInProgress.entries()).map(([modelName, text]) => (
+                    <ThinkingStream key={modelName} modelName={modelName} text={text} />
+                  ))}
+                  {outputPreviewInProgress.size > 0 && Array.from(outputPreviewInProgress.entries()).map(([modelName, text]) => (
+                    <OutputPreviewStream key={modelName} modelName={modelName} text={text} />
+                  ))}
                 </div>
               ) : null}
             </div>
@@ -2108,14 +2299,25 @@ export function LlmgpsShell() {
                       {t.chat.responders(responderModels.length)}
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => void sendMessage()}
-                    disabled={busy || !draft.trim()}
-                    className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] transition-opacity focus:outline-none disabled:opacity-30"
-                  >
-                    ↑
-                  </button>
+                  {busy ? (
+                    <button
+                      type="button"
+                      onClick={stopGeneration}
+                      className="flex h-8 w-8 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface-color)] text-[var(--foreground)] transition-opacity hover:bg-[var(--surface-subtle)] focus:outline-none"
+                      title="Stop generation"
+                    >
+                      ■
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void sendMessage()}
+                      disabled={!draft.trim()}
+                      className="flex h-8 w-8 items-center justify-center rounded-full bg-[var(--foreground)] text-[var(--background)] transition-opacity focus:outline-none disabled:opacity-30"
+                    >
+                      ↑
+                    </button>
+                  )}
                 </div>
               </div>
               <div className="mt-2 text-center text-xs text-[var(--muted)]">
@@ -2675,6 +2877,154 @@ export function LlmgpsShell() {
                     className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
                     {settingsBusy === "websearch" ? t.settings.savingWebSearch : t.settings.saveWebSearch}
+                  </button>
+                </div>
+              </section>
+
+              <section className="space-y-4 pb-20">
+                <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  {t.settings.userMemories}
+                </h3>
+                <p className="text-sm text-[var(--muted)]">{t.settings.userMemoriesDesc}</p>
+
+                <div className="flex items-center gap-3">
+                  <input
+                    id="enable-memories"
+                    type="checkbox"
+                    checked={userMemoriesConfig.enabled}
+                    onChange={(e) => setUserMemoriesConfig((prev) => ({ ...prev, enabled: e.target.checked }))}
+                    className="h-4 w-4 rounded"
+                  />
+                  <label htmlFor="enable-memories" className="text-sm font-medium">
+                    {t.settings.enableMemories}
+                  </label>
+                </div>
+
+                <div className="space-y-2">
+                  {userMemoriesConfig.memories.map((mem) => (
+                    <div key={mem.id} className="flex items-start gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+                      <span className="flex-1 text-sm">{mem.text}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setUserMemoriesConfig((prev) => ({
+                            ...prev,
+                            memories: prev.memories.filter((m) => m.id !== mem.id),
+                          }))
+                        }
+                        className="shrink-0 text-[var(--muted)] hover:text-red-500"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {userMemoriesConfig.memories.length < 20 ? (
+                  <div className="space-y-2">
+                    <textarea
+                      value={memoryDraft}
+                      onChange={(e) => setMemoryDraft(e.target.value)}
+                      placeholder={t.settings.memoryPlaceholder}
+                      rows={3}
+                      className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm outline-none focus:border-[var(--foreground)]"
+                    />
+                    <div className="flex items-center justify-between">
+                      <span className={`text-xs ${memoryDraft.trim().split(/\s+/).filter(Boolean).length > 160 ? "text-red-500" : "text-[var(--muted)]"}`}>
+                        {t.settings.wordCount(memoryDraft.trim().split(/\s+/).filter(Boolean).length)}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={
+                          !memoryDraft.trim() ||
+                          memoryDraft.trim().split(/\s+/).filter(Boolean).length > 160
+                        }
+                        onClick={() => {
+                          const text = memoryDraft.trim();
+                          if (!text) return;
+                          const words = text.split(/\s+/).filter(Boolean);
+                          if (words.length > 160) return;
+                          setUserMemoriesConfig((prev) => ({
+                            ...prev,
+                            memories: [...prev.memories, { id: makeId(), text }],
+                          }));
+                          setMemoryDraft("");
+                        }}
+                        className="rounded-xl border border-[var(--border)] px-4 py-1.5 text-sm font-medium transition-opacity hover:opacity-80 disabled:opacity-40"
+                      >
+                        {t.settings.addMemory}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+
+                <div className="flex items-center justify-between pt-1">
+                  <span className="text-xs text-[var(--muted)]">
+                    {t.settings.memoryCount(userMemoriesConfig.memories.length, 20)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void saveMemoriesSettings()}
+                    disabled={settingsBusy !== null && settingsBusy !== "memories"}
+                    className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                  >
+                    {settingsBusy === "memories" ? t.settings.savingMemories : t.settings.saveMemories}
+                  </button>
+                </div>
+              </section>
+
+              {/* Extended Thinking */}
+              <section className="space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-6">
+                <div>
+                  <h3 className="font-semibold">{t.settings.extendedThinking}</h3>
+                  <p className="mt-1 text-sm text-[var(--muted)]">{t.settings.extendedThinkingDesc}</p>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm">{t.settings.enableExtendedThinking}</span>
+                  <button
+                    type="button"
+                    onClick={() => setThinkingConfig((prev) => ({ ...prev, anthropicExtendedThinking: !prev.anthropicExtendedThinking }))}
+                    className={cx(
+                      "relative h-6 w-11 rounded-full transition-colors",
+                      thinkingConfig.anthropicExtendedThinking ? "bg-[var(--foreground)]" : "bg-[var(--border)]",
+                    )}
+                  >
+                    <span
+                      className={cx(
+                        "absolute top-0.5 h-5 w-5 rounded-full bg-[var(--background)] transition-transform",
+                        thinkingConfig.anthropicExtendedThinking ? "translate-x-5" : "translate-x-0.5",
+                      )}
+                    />
+                  </button>
+                </div>
+                {thinkingConfig.anthropicExtendedThinking ? (
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">{t.settings.budgetTokens}</label>
+                    <p className="text-xs text-[var(--muted)]">{t.settings.budgetTokensDesc}</p>
+                    <input
+                      type="number"
+                      min={1000}
+                      max={32000}
+                      step={1000}
+                      value={thinkingConfig.anthropicBudgetTokens}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10);
+                        if (!isNaN(v) && v >= 1000 && v <= 32000) {
+                          setThinkingConfig((prev) => ({ ...prev, anthropicBudgetTokens: v }));
+                        }
+                      }}
+                      className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-color)] px-3 py-2 text-sm"
+                    />
+                  </div>
+                ) : null}
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={() => void saveThinkingSettings()}
+                    disabled={settingsBusy !== null && settingsBusy !== "thinking"}
+                    className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                  >
+                    {settingsBusy === "thinking" ? t.settings.savingThinking : t.settings.saveThinking}
                   </button>
                 </div>
               </section>

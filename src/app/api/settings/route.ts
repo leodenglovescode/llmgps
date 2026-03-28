@@ -6,12 +6,16 @@ import {
   sanitizeOllamaConfig,
   sanitizeProxyConfig,
   sanitizeRoutingPreferences,
+  sanitizeThinkingConfig,
+  sanitizeUserMemoriesConfig,
   sanitizeWebSearchConfig,
   type CustomEndpointConfig,
   type Language,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
+  type ThinkingConfig,
+  type UserMemoriesConfig,
   type WebSearchConfig,
 } from "@/lib/app-config";
 import { getAuthenticatedUsername } from "@/lib/server-auth";
@@ -26,6 +30,8 @@ type SettingsPayload = {
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
+  thinkingConfig?: Partial<ThinkingConfig>;
+  userMemories?: Partial<UserMemoriesConfig>;
   webSearchConfig?: Partial<WebSearchConfig>;
 };
 
@@ -57,6 +63,12 @@ export async function POST(request: NextRequest) {
       proxyConfig: payload.proxyConfig ? sanitizeProxyConfig(payload.proxyConfig) : undefined,
       routingPreferences: payload.routingPreferences
         ? sanitizeRoutingPreferences(payload.routingPreferences)
+        : undefined,
+      thinkingConfig: payload.thinkingConfig
+        ? sanitizeThinkingConfig(payload.thinkingConfig)
+        : undefined,
+      userMemories: payload.userMemories
+        ? sanitizeUserMemoriesConfig(payload.userMemories)
         : undefined,
       webSearchConfig: payload.webSearchConfig
         ? sanitizeWebSearchConfig(payload.webSearchConfig)
