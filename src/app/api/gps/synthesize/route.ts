@@ -23,7 +23,9 @@ export async function POST(request: NextRequest) {
     const consensus = await runSynthesisOnly({
       ...payload,
       apiKeys: executionSettings.apiKeys,
+      customEndpointBaseUrl: executionSettings.customEndpointBaseUrl,
       ollamaBaseUrl: executionSettings.ollamaBaseUrl,
+      ollamaBypassProxy: executionSettings.ollamaBypassProxy,
       proxyUrl: executionSettings.proxyUrl,
     });
 

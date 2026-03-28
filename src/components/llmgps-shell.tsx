@@ -6,17 +6,21 @@ import remarkGfm from "remark-gfm";
 
 import {
   defaultCompressionConfig,
+  defaultCustomEndpointConfig,
   defaultOllamaConfig,
   defaultProxyConfig,
   defaultRoutingPreferences,
   defaultWebSearchConfig,
   type AppStatusPayload,
   type CompressionConfig,
+  type CustomEndpointConfig,
+  type Language,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
   type WebSearchConfig,
 } from "@/lib/app-config";
+import { en, zh, resolveLocale, type Locale } from "@/lib/locales";
 import {
   buildConversationSummary,
   type CompressionRound,
@@ -35,7 +39,7 @@ import {
 } from "@/lib/llm";
 
 type ThemeMode = "dark" | "light";
-type ViewId = "chat" | "runs" | "settings";
+type ViewId = "chat" | "runs" | "settings" | "apikeys";
 type AuthView = "app" | "loading" | "login" | "setup";
 
 type UiMessage = ConversationMessage;
@@ -84,7 +88,9 @@ const initialMessages: UiMessage[] = [];
 const initialStatus: AppStatusPayload = {
   authenticated: false,
   configuredProviders: [],
+  customEndpointConfig: defaultCustomEndpointConfig,
   initialized: false,
+  language: "auto",
   ollamaConfig: defaultOllamaConfig,
   proxyConfig: defaultProxyConfig,
   routingPreferences: defaultRoutingPreferences,
@@ -109,10 +115,15 @@ function makeEmptyApiKeyDrafts(): Record<ProviderId, string> {
     anthropic: "",
     deepseek: "",
     gemini: "",
+    kimi: "",
+    mistral: "",
     ollama: "",
     openai: "",
     openrouter: "",
+    qwen: "",
     xai: "",
+    zhipu: "",
+    custom: "",
   };
 }
 
@@ -121,10 +132,15 @@ function makeEmptyCustomDrafts(): Record<ProviderId, string> {
     anthropic: "",
     deepseek: "",
     gemini: "",
+    kimi: "",
+    mistral: "",
     ollama: "",
     openai: "",
     openrouter: "",
+    qwen: "",
     xai: "",
+    zhipu: "",
+    custom: "",
   };
 }
 
@@ -153,23 +169,22 @@ function loadTheme(): ThemeMode {
   return stored === "light" ? "light" : "dark";
 }
 
-function getTimeBasedGreeting(date: Date, username: string | null) {
+function getTimeBasedGreeting(date: Date, username: string | null, t: Locale) {
   const hour = date.getHours();
-  const greeting = hour < 12 ? "Good Morning" : hour < 18 ? "Good Afternoon" : "Good Evening";
-
-  return username ? `${greeting}, ${username}.` : greeting;
+  const greeting = hour < 12 ? t.chat.goodMorning : hour < 18 ? t.chat.goodAfternoon : t.chat.goodEvening;
+  return username ? t.chat.greeting(greeting, username) : greeting;
 }
 
-function buildWelcomePrompts(date: Date, username: string | null) {
+function buildWelcomePrompts(date: Date, username: string | null, t: Locale) {
   const trimmedUsername = username?.trim() || null;
   const prompts = [
-    getTimeBasedGreeting(date, trimmedUsername),
-    "What's on your mind today?",
-    "How can I help?",
+    getTimeBasedGreeting(date, trimmedUsername, t),
+    t.chat.whatsOnYourMind,
+    t.chat.howCanIHelp,
   ];
 
   if (trimmedUsername) {
-    prompts.splice(1, 0, `Welcome back, ${trimmedUsername}!`);
+    prompts.splice(1, 0, t.chat.welcomeBack(trimmedUsername));
   }
 
   return prompts;
@@ -177,6 +192,7 @@ function buildWelcomePrompts(date: Date, username: string | null) {
 
 export function LlmgpsShell() {
   const [theme, setTheme] = useState<ThemeMode>("dark");
+  const [language, setLanguage] = useState<Language>("auto");
   const [activeView, setActiveView] = useState<ViewId>("chat");
   const [authView, setAuthView] = useState<AuthView>("loading");
   const [status, setStatus] = useState<AppStatusPayload>(initialStatus);
@@ -198,6 +214,7 @@ export function LlmgpsShell() {
   const [ollamaConfig, setOllamaConfig] = useState<OllamaConfig>(defaultOllamaConfig);
   const [proxyConfig, setProxyConfig] = useState<ProxyConfig>(defaultProxyConfig);
   const [webSearchConfig, setWebSearchConfig] = useState<WebSearchConfig>(defaultWebSearchConfig);
+  const [customEndpointConfig, setCustomEndpointConfig] = useState<CustomEndpointConfig>(defaultCustomEndpointConfig);
   const [debateMode, setDebateMode] = useState<boolean>(false);
   const [progressMsg, setProgressMsg] = useState<string>("");
   const [messages, setMessages] = useState<UiMessage[]>(initialMessages);
@@ -232,7 +249,9 @@ export function LlmgpsShell() {
   const [ollamaModels, setOllamaModels] = useState<string[]>([]);
   const [ollamaModelsBusy, setOllamaModelsBusy] = useState(false);
   const [ollamaModelsError, setOllamaModelsError] = useState<string | null>(null);
+  const [searchQueryModel, setSearchQueryModel] = useState<ModelSelection | null>(null);
   const [compressionEnabled, setCompressionEnabled] = useState<boolean>(false);
+  const [compressionModel, setCompressionModel] = useState<ModelSelection | null>(null);
   const [rollingContext, setRollingContext] = useState<boolean>(false);
   const [compressionTargetTokens, setCompressionTargetTokens] = useState<number>(1500);
   const [compressedContext, setCompressedContext] = useState<string | null>(null);
@@ -242,6 +261,8 @@ export function LlmgpsShell() {
     setCustomModels(nextPreferences.customModels);
     setResponderModels(nextPreferences.responderModels);
     setSynthesizerModel(nextPreferences.synthesizerModel);
+    setSearchQueryModel(nextPreferences.searchQueryModel);
+    setCompressionModel(nextPreferences.compressionModel);
     setDebateMode(nextPreferences.debateMode);
     if (nextPreferences.debateMode) setGpsMode(false);
     setCompressionEnabled(nextPreferences.compressionConfig?.enabled ?? false);
@@ -249,11 +270,15 @@ export function LlmgpsShell() {
     setCompressionTargetTokens(nextPreferences.compressionConfig?.targetTokens ?? 1500);
   }
 
-  function applyStatus(nextStatus: AppStatusPayload, options?: { syncRoutingPreferences?: boolean }) {
+  function applyStatus(nextStatus: AppStatusPayload, options?: { syncLanguage?: boolean; syncRoutingPreferences?: boolean }) {
     setStatus(nextStatus);
+    if (nextStatus.authenticated && options?.syncLanguage) {
+      setLanguage(nextStatus.language ?? "auto");
+    }
     setOllamaConfig(nextStatus.authenticated ? nextStatus.ollamaConfig : { ...defaultOllamaConfig });
     setProxyConfig(nextStatus.authenticated ? nextStatus.proxyConfig : { ...defaultProxyConfig });
     setWebSearchConfig(nextStatus.authenticated ? nextStatus.webSearchConfig : { ...defaultWebSearchConfig });
+    setCustomEndpointConfig(nextStatus.authenticated ? nextStatus.customEndpointConfig : { ...defaultCustomEndpointConfig });
     if (nextStatus.authenticated && nextStatus.webSearchConfig.apiKey?.trim()) {
       setWebSearchEnabled(nextStatus.webSearchConfig.enabled);
     } else {
@@ -321,6 +346,8 @@ export function LlmgpsShell() {
 
   async function saveSettings(payload: {
     apiKeys?: Partial<Record<ProviderId, string | null>>;
+    customEndpointConfig?: CustomEndpointConfig;
+    language?: Language;
     ollamaConfig?: OllamaConfig;
     proxyConfig?: ProxyConfig;
     routingPreferences?: RoutingPreferencesPayload;
@@ -510,6 +537,7 @@ export function LlmgpsShell() {
         applyStatusEvent(nextStatus);
         if (!cancelled && nextStatus.authenticated) {
           applyRoutingPreferences(nextStatus.routingPreferences);
+          setLanguage(nextStatus.language ?? "auto");
         }
         if (!cancelled && nextStatus.initialized && nextStatus.username) {
           setLoginForm((current) => ({ ...current, username: nextStatus.username || current.username }));
@@ -551,14 +579,19 @@ export function LlmgpsShell() {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
   }, [customModels, debateMode, responderModels, synthesizerModel, hydrated]);
 
+  const t = useMemo(
+    () => resolveLocale(language) === "zh" ? zh : en,
+    [language],
+  );
+
   const configuredProviders = useMemo(
     () => new Set(status.configuredProviders),
     [status.configuredProviders],
   );
 
   const welcomePrompts = useMemo(
-    () => buildWelcomePrompts(welcomeNow, status.username),
-    [status.username, welcomeNow],
+    () => buildWelcomePrompts(welcomeNow, status.username, t),
+    [status.username, welcomeNow, t],
   );
 
   const activeWelcomePrompt = welcomePrompts[welcomeIndex % welcomePrompts.length] || "How can I help?";
@@ -626,17 +659,8 @@ export function LlmgpsShell() {
   );
 
   const availableModels = useMemo(() => {
-    const presets = connectedProviders.flatMap((provider) =>
-      provider.models.map((model) => ({
-        label: model.label,
-        modelId: model.modelId,
-        providerId: model.providerId,
-      })),
-    );
-    const allModels = [...presets, ...customModels];
-
     const seen = new Set<string>();
-    return allModels.filter((model) => {
+    return customModels.filter((model) => {
       const key = serializeModelSelection(model);
       if (seen.has(key)) {
         return false;
@@ -644,7 +668,7 @@ export function LlmgpsShell() {
       seen.add(key);
       return true;
     });
-  }, [connectedProviders, customModels]);
+  }, [customModels]);
 
   useEffect(() => {
     if (availableModels.length === 0) {
@@ -672,12 +696,14 @@ export function LlmgpsShell() {
       if (exists) {
         return current.filter((entry) => serializeModelSelection(entry) !== key);
       }
-      if (current.length >= 5) {
+      // Replace any existing model from the same provider
+      const withoutSameProvider = current.filter((entry) => entry.providerId !== model.providerId);
+      if (withoutSameProvider.length >= 5) {
         setError("You can select up to 5 responder models.");
         return current;
       }
       setError(null);
-      return [...current, model];
+      return [...withoutSameProvider, model];
     });
   }
 
@@ -789,7 +815,7 @@ export function LlmgpsShell() {
         throw new Error(data.error || `HTTP error ${response.status}`);
       }
 
-      applyStatus(data, { syncRoutingPreferences: true });
+      applyStatus(data, { syncLanguage: true, syncRoutingPreferences: true });
       setLoginForm((current) => ({ ...current, password: "" }));
       setApiKeyDrafts(makeEmptyApiKeyDrafts());
       setSettingsNotice(null);
@@ -958,6 +984,23 @@ export function LlmgpsShell() {
     }
   }
 
+  async function saveLanguageSettings() {
+    setSettingsBusy("language");
+    setSettingsNotice(null);
+    setError(null);
+
+    try {
+      await saveSettings({ language });
+      setSettingsNotice(t.settings.languageSaved);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Unable to save language setting.",
+      );
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
   async function saveWebSearchSettings() {
     setSettingsBusy("websearch");
     setSettingsNotice(null);
@@ -979,6 +1022,23 @@ export function LlmgpsShell() {
     }
   }
 
+  async function saveCustomEndpointSettings() {
+    setSettingsBusy("custom-endpoint");
+    setSettingsNotice(null);
+    setError(null);
+
+    try {
+      await saveSettings({ customEndpointConfig });
+      setSettingsNotice(t.settings.endpointSaved);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "Unable to save endpoint settings.",
+      );
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
   async function saveRoutingPreferences() {
     setSettingsBusy("routing");
     setSettingsNotice(null);
@@ -992,6 +1052,8 @@ export function LlmgpsShell() {
             debateMode,
             responderModels,
             synthesizerModel,
+            searchQueryModel,
+            compressionModel,
             compressionConfig: {
               enabled: compressionEnabled,
               rollingContext,
@@ -1048,7 +1110,7 @@ export function LlmgpsShell() {
     }
 
     if (gpsMode && !synthesizerModel) {
-      setError("Choose a synthesizer model before using GPS Mode.");
+      setError(t.chat.noSynthesizerError);
       setActiveView("settings");
       return;
     }
@@ -1103,6 +1165,8 @@ export function LlmgpsShell() {
           messages: payloadMessages,
           responderModels,
           synthesizerModel,
+          searchQueryModel,
+          compressionModel,
           webSearchEnabled,
           compressionConfig: compressionEnabled
             ? { enabled: compressionEnabled, rollingContext, targetTokens: compressionTargetTokens, modelContextOverrides: {} }
@@ -1331,12 +1395,12 @@ export function LlmgpsShell() {
   if (authView !== "app") {
     const showSetup = authView === "setup";
     const authStatusLabel = authView === "loading"
-      ? "Checking workspace"
+      ? t.auth.checkingWorkspace
       : showSetup
-        ? `${setupReadiness}/3 ready`
+        ? t.auth.setupReady(setupReadiness)
         : loginReady
-          ? "Ready to sign in"
-          : "Enter your credentials";
+          ? t.auth.readyToSignIn
+          : t.auth.enterCredentials;
 
     return (
       <main
@@ -1353,10 +1417,10 @@ export function LlmgpsShell() {
                 <div className="text-sm uppercase tracking-[0.3em] text-[var(--muted)]">llmgps</div>
                 <h1 className="mt-2 text-3xl font-semibold tracking-tight">
                   {authView === "loading"
-                    ? "Loading workspace"
+                    ? t.auth.loadingWorkspace
                     : showSetup
-                      ? "Create the owner account"
-                      : "Sign in to llmgps"}
+                      ? t.auth.createOwnerAccount
+                      : t.auth.signIn}
                 </h1>
               </div>
               <button
@@ -1364,7 +1428,7 @@ export function LlmgpsShell() {
                 onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
                 className="rounded-full border border-[var(--border)] bg-[var(--surface-subtle)] px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
               >
-                {theme === "dark" ? "Light theme" : "Dark theme"}
+                {theme === "dark" ? t.auth.lightTheme : t.auth.darkTheme}
               </button>
             </div>
 
@@ -1372,7 +1436,7 @@ export function LlmgpsShell() {
               <div className="mb-8 flex items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
                   <span className="rounded-full border border-[var(--border)] bg-[var(--surface-subtle)] px-3 py-1 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                    {showSetup ? "Setup" : authView === "loading" ? "Boot" : "Login"}
+                    {showSetup ? t.auth.setup : authView === "loading" ? t.auth.boot : t.auth.login}
                   </span>
                   <div className="h-px w-10 bg-[var(--border)]" />
                   <span className="text-sm text-[var(--muted)]">{authStatusLabel}</span>
@@ -1391,11 +1455,11 @@ export function LlmgpsShell() {
                   >
                     {showSetup
                       ? showSetupPasswords
-                        ? "Hide passwords"
-                        : "Show passwords"
+                        ? t.auth.hidePasswords
+                        : t.auth.showPasswords
                       : showLoginPassword
-                        ? "Hide password"
-                        : "Show password"}
+                        ? t.auth.hidePassword
+                        : t.auth.showPassword}
                   </button>
                 ) : null}
               </div>
@@ -1403,7 +1467,7 @@ export function LlmgpsShell() {
               {authView === "loading" ? (
                 <div className="space-y-5">
                   <p className="text-[15px] text-[var(--muted)]">
-                    Checking setup status and existing login session.
+                    {t.auth.checkingSetup}
                   </p>
                   <div className="h-1.5 overflow-hidden rounded-full bg-[var(--surface-subtle)]">
                     <div className="h-full w-1/2 animate-pulse rounded-full bg-[var(--foreground)]/70" />
@@ -1417,7 +1481,7 @@ export function LlmgpsShell() {
               ) : showSetup ? (
                 <form className="space-y-5" onSubmit={handleSetup}>
                   <p className="max-w-md text-[15px] leading-relaxed text-[var(--muted)]">
-                    Create the first local owner account for this deployment.
+                    {t.auth.createFirstAccount}
                   </p>
 
                   {authError ? (
@@ -1427,7 +1491,7 @@ export function LlmgpsShell() {
                   ) : null}
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Username</label>
+                    <label className="text-sm font-medium">{t.auth.username}</label>
                     <input
                       type="text"
                       value={setupForm.username}
@@ -1442,7 +1506,7 @@ export function LlmgpsShell() {
 
                   <div className="grid gap-4 md:grid-cols-2">
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Password</label>
+                      <label className="text-sm font-medium">{t.auth.password}</label>
                       <input
                         type={showSetupPasswords ? "text" : "password"}
                         value={setupForm.password}
@@ -1451,12 +1515,12 @@ export function LlmgpsShell() {
                         }
                         className="w-full rounded-2xl border border-[var(--border)] bg-[var(--background)] px-4 py-3 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
                         autoComplete="new-password"
-                        placeholder="Create a password"
+                        placeholder={t.auth.createPasswordPlaceholder}
                       />
                     </div>
 
                     <div className="space-y-2">
-                      <label className="text-sm font-medium">Confirm Password</label>
+                      <label className="text-sm font-medium">{t.auth.confirmPassword}</label>
                       <input
                         type={showSetupPasswords ? "text" : "password"}
                         value={setupForm.confirmPassword}
@@ -1468,7 +1532,7 @@ export function LlmgpsShell() {
                         }
                         className="w-full rounded-2xl border border-[var(--border)] bg-[var(--background)] px-4 py-3 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
                         autoComplete="new-password"
-                        placeholder="Repeat the password"
+                        placeholder={t.auth.repeatPasswordPlaceholder}
                       />
                     </div>
                   </div>
@@ -1476,24 +1540,24 @@ export function LlmgpsShell() {
                   <div className="flex items-center justify-between gap-4 pt-1">
                     <p className="text-sm text-[var(--muted)]">
                       {setupPasswordsMatch
-                        ? "Passwords match."
+                        ? t.auth.passwordsMatch
                         : setupConfirmFilled
-                          ? "Passwords do not match yet."
-                          : "Use a password you will keep for this deployment."}
+                          ? t.auth.passwordsNoMatch
+                          : t.auth.keepPassword}
                     </p>
                     <button
                       type="submit"
                       disabled={authBusy}
                       className="rounded-2xl bg-[var(--foreground)] px-5 py-3 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                     >
-                      {authBusy ? "Creating owner..." : "Create owner account"}
+                      {authBusy ? t.auth.creatingOwner : t.auth.createOwnerBtn}
                     </button>
                   </div>
                 </form>
               ) : (
                 <form className="space-y-5" onSubmit={handleLogin}>
                   <p className="max-w-md text-[15px] leading-relaxed text-[var(--muted)]">
-                    Sign in to access the workspace and server-stored provider settings.
+                    {t.auth.signInDesc}
                   </p>
 
                   {authError ? (
@@ -1503,7 +1567,7 @@ export function LlmgpsShell() {
                   ) : null}
 
                   <div className="space-y-2">
-                    <label className="text-sm font-medium">Username</label>
+                    <label className="text-sm font-medium">{t.auth.username}</label>
                     <input
                       type="text"
                       value={loginForm.username}
@@ -1512,13 +1576,13 @@ export function LlmgpsShell() {
                       }
                       className="w-full rounded-2xl border border-[var(--border)] bg-[var(--background)] px-4 py-3 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
                       autoComplete="username"
-                      placeholder="Enter the owner username"
+                      placeholder={t.auth.enterUsername}
                     />
                   </div>
 
                   <div className="space-y-2">
                     <div className="flex items-center justify-between">
-                      <label className="text-sm font-medium">Password</label>
+                      <label className="text-sm font-medium">{t.auth.password}</label>
                       {suggestedUsername ? (
                         <button
                           type="button"
@@ -1527,7 +1591,7 @@ export function LlmgpsShell() {
                           }
                           className="text-xs text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
                         >
-                          Use {suggestedUsername}
+                          {t.auth.useUsername(suggestedUsername)}
                         </button>
                       ) : null}
                     </div>
@@ -1539,24 +1603,24 @@ export function LlmgpsShell() {
                       }
                       className="w-full rounded-2xl border border-[var(--border)] bg-[var(--background)] px-4 py-3 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
                       autoComplete="current-password"
-                      placeholder="Enter the owner password"
+                      placeholder={t.auth.enterPassword}
                     />
                   </div>
 
                   <div className="flex items-center justify-between gap-4 pt-1">
                     <p className="text-sm text-[var(--muted)]">
                       {loginReady
-                        ? "Ready when you are."
+                        ? t.auth.readyWhenYouAre
                         : suggestedUsername
-                          ? `Owner username detected: ${suggestedUsername}`
-                          : "Use the owner account created on first run."}
+                          ? t.auth.ownerDetected(suggestedUsername)
+                          : t.auth.useOwnerAccount}
                     </p>
                     <button
                       type="submit"
                       disabled={authBusy}
                       className="rounded-2xl bg-[var(--foreground)] px-5 py-3 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                     >
-                      {authBusy ? "Signing in..." : "Sign in"}
+                      {authBusy ? t.auth.signingIn : t.auth.signInBtn}
                     </button>
                   </div>
                 </form>
@@ -1580,13 +1644,16 @@ export function LlmgpsShell() {
 
         <div className="flex flex-1 flex-col gap-1 p-2 md:p-3">
           {sidebarItems.map((item) => {
-            const active = activeView === item.id;
+            const active = item.id === "settings"
+              ? activeView === "settings" || activeView === "apikeys"
+              : activeView === item.id;
+            const label = item.id === "chat" ? t.sidebar.chat : item.id === "runs" ? t.sidebar.chatHistory : t.sidebar.settings;
             return (
               <button
                 key={item.id}
                 type="button"
                 onClick={() => setActiveView(item.id)}
-                title={item.label}
+                title={label}
                 className={cx(
                   "flex items-center gap-3 rounded-lg p-3 text-left text-sm transition-colors md:px-3 md:py-2.5",
                   active
@@ -1595,7 +1662,7 @@ export function LlmgpsShell() {
                 )}
               >
                 <span className="text-xl md:text-lg">{item.emoji}</span>
-                <span className="hidden md:block">{item.label}</span>
+                <span className="hidden md:block">{label}</span>
               </button>
             );
           })}
@@ -1603,7 +1670,7 @@ export function LlmgpsShell() {
 
         <div className="flex flex-col gap-1 border-t border-[var(--border)] p-2 md:p-3">
           <div className="hidden rounded-lg px-3 py-2 text-xs text-[var(--muted)] md:block">
-            Signed in as {status.username}
+            {t.sidebar.signedInAs} {status.username}
           </div>
           <button
             type="button"
@@ -1612,7 +1679,7 @@ export function LlmgpsShell() {
             className="flex items-center gap-3 rounded-lg p-3 text-left text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--foreground)] md:px-3 md:py-2.5"
           >
             <span className="text-xl md:text-lg">{theme === "dark" ? "☀️" : "🌙"}</span>
-            <span className="hidden md:block">{theme === "dark" ? "Light theme" : "Dark theme"}</span>
+            <span className="hidden md:block">{theme === "dark" ? t.sidebar.lightTheme : t.sidebar.darkTheme}</span>
           </button>
           <button
             type="button"
@@ -1620,7 +1687,7 @@ export function LlmgpsShell() {
             className="flex items-center gap-3 rounded-lg p-3 text-left text-sm text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--foreground)] md:px-3 md:py-2.5"
           >
             <span className="text-xl md:text-lg">⇠</span>
-            <span className="hidden md:block">Log out</span>
+            <span className="hidden md:block">{t.sidebar.logOut}</span>
           </button>
         </div>
       </aside>
@@ -1632,10 +1699,10 @@ export function LlmgpsShell() {
               <div className="space-y-4">
                 <div>
                   <div className="text-sm uppercase tracking-[0.25em] text-[var(--muted)]">First Login</div>
-                  <h2 className="mt-2 text-2xl font-semibold">Add API keys now?</h2>
+                  <h2 className="mt-2 text-2xl font-semibold">{t.chat.addApiKeysTitle}</h2>
                 </div>
                 <p className="text-[15px] leading-relaxed text-[var(--muted)]">
-                  You can start by configuring provider keys immediately, or skip it and come back later from Settings.
+                  {t.chat.addApiKeysDesc}
                 </p>
                 <div className="flex flex-wrap gap-3 pt-2">
                   <button
@@ -1644,7 +1711,7 @@ export function LlmgpsShell() {
                     disabled={settingsBusy === "onboarding"}
                     className="rounded-2xl bg-[var(--foreground)] px-5 py-3 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
-                    Go to Settings
+                    {t.chat.goToSettings}
                   </button>
                   <button
                     type="button"
@@ -1652,7 +1719,7 @@ export function LlmgpsShell() {
                     disabled={settingsBusy === "onboarding"}
                     className="rounded-2xl border border-[var(--border)] px-5 py-3 text-sm font-medium text-[var(--muted)] transition-colors hover:text-[var(--foreground)] disabled:opacity-50"
                   >
-                    Maybe later
+                    {t.chat.maybeLater}
                   </button>
                 </div>
               </div>
@@ -1664,9 +1731,9 @@ export function LlmgpsShell() {
           <div key="view-chat" className="panel-fade-in relative mx-auto flex h-full w-full max-w-3xl flex-col px-4 sm:px-6">
             <div className="flex items-center justify-between border-b border-[var(--border)] py-4">
               <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">Current Chat</div>
+                <div className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">{t.chat.currentChat}</div>
                 <div className="mt-1 text-sm text-[var(--foreground)]">
-                  {activeConversationSummary?.title || "New conversation"}
+                  {activeConversationSummary?.title || t.chat.newConversation}
                 </div>
               </div>
               <div className="flex gap-2">
@@ -1675,7 +1742,7 @@ export function LlmgpsShell() {
                   onClick={() => setActiveView("runs")}
                   className="rounded-full border border-[var(--border)] px-3 py-2 text-xs text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
                 >
-                  Chat History
+                  {t.chat.chatHistoryBtn}
                 </button>
                 <button
                   type="button"
@@ -1685,7 +1752,7 @@ export function LlmgpsShell() {
                   }}
                   className="rounded-full border border-[var(--border)] px-3 py-2 text-xs text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
                 >
-                  New chat
+                  {t.chat.newChat}
                 </button>
               </div>
             </div>
@@ -1764,7 +1831,7 @@ export function LlmgpsShell() {
                           >
                             ▸
                           </span>
-                          {thoughtsExpanded ? "Collapse Thought Process" : "Expand Thought Process"}
+                          {thoughtsExpanded ? t.chat.collapseThoughts : t.chat.expandThoughts}
                         </button>
                         {thoughtsExpanded ? (
                           <div className="mt-2 space-y-4">{nodes}</div>
@@ -1964,7 +2031,7 @@ export function LlmgpsShell() {
                           gpsMode ? "bg-[var(--foreground)]" : "bg-[var(--muted)]",
                         )}
                       />
-                      GPS Mode
+                      {t.chat.gpsMode}
                     </button>
                     <button
                       type="button"
@@ -1987,7 +2054,7 @@ export function LlmgpsShell() {
                           debateMode ? "bg-amber-500" : "bg-[var(--muted)]",
                         )}
                       />
-                      Debate Mode
+                      {t.chat.debateMode}
                     </button>
                     {compressionEnabled && compressedContext && (
                       <div
@@ -1995,7 +2062,7 @@ export function LlmgpsShell() {
                         title="Rolling compressed context is active for this conversation"
                       >
                         <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                        Rolling
+                        {t.chat.rolling}
                       </div>
                     )}
                     {webSearchConfig.enabled && webSearchConfig.apiKey?.trim() ? (
@@ -2016,11 +2083,11 @@ export function LlmgpsShell() {
                             webSearchEnabled ? "bg-cyan-500" : "bg-[var(--muted)]",
                           )}
                         />
-                        Web Search
+                        {t.chat.webSearch}
                       </button>
                     ) : null}
                     <div className="flex items-center px-2 py-1 text-xs text-[var(--muted)]">
-                      {responderModels.length} responders
+                      {t.chat.responders(responderModels.length)}
                     </div>
                   </div>
                   <button
@@ -2044,9 +2111,9 @@ export function LlmgpsShell() {
           <div key="view-settings" className="panel-fade-in h-full overflow-y-auto">
             <div className="mx-auto w-full max-w-3xl space-y-10 px-6 py-10">
               <div className="space-y-3">
-                <h2 className="text-2xl font-semibold">Settings</h2>
+                <h2 className="text-2xl font-semibold">{t.settings.title}</h2>
                 <p className="text-[15px] text-[var(--muted)]">
-                  Provider credentials, Ollama connection settings, and routing defaults are stored on the server for this deployment.
+                  {t.settings.desc}
                 </p>
                 {settingsNotice ? (
                   <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-600">
@@ -2062,260 +2129,72 @@ export function LlmgpsShell() {
 
               <section className="space-y-4">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Providers & Models
+                  {t.settings.language}
                 </h3>
-
-                <div className="mt-4 grid gap-4">
-                  {PROVIDER_PRESETS.map((provider) => {
-                    const providerModels = customModels.filter(
-                      (model) => model.providerId === provider.id,
-                    );
-                    const hasStoredKey = provider.authStrategy === "api-key" && configuredProviders.has(provider.id);
-                    const hasOllamaEnabled = provider.id === "ollama" && ollamaConfig.enabled;
-
-                    return (
-                      <div
-                        key={provider.id}
-                        className="rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5"
-                      >
-                        <div className="mb-4 flex items-center justify-between gap-4">
-                          <div>
-                            <div className="font-medium text-[15px]">{provider.name}</div>
-                            <div className="mt-1 text-xs text-[var(--muted)]">
-                              {provider.id === "ollama"
-                                ? hasOllamaEnabled
-                                  ? "Local Ollama routing enabled"
-                                  : "Ollama disabled"
-                                : hasStoredKey
-                                  ? "API key stored on server"
-                                  : "No API key saved yet"}
-                            </div>
-                          </div>
-                          <a
-                            href={provider.docsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="text-xs text-[var(--muted)] underline transition-colors hover:text-[var(--foreground)]"
-                          >
-                            Docs
-                          </a>
-                        </div>
-
-                        <div className="space-y-4">
-                          {provider.authStrategy === "api-key" ? (
-                            <div className="flex flex-col gap-3 sm:flex-row">
-                              <input
-                                type="password"
-                                autoComplete="off"
-                                placeholder={
-                                  hasStoredKey
-                                    ? "Stored on server. Enter a new value to replace it."
-                                    : provider.apiKeyPlaceholder
-                                }
-                                value={apiKeyDrafts[provider.id]}
-                                onChange={(event) =>
-                                  setApiKeyDrafts((current) => ({
-                                    ...current,
-                                    [provider.id]: event.target.value,
-                                  }))
-                                }
-                                className="w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-sm outline-none transition-colors focus:border-[var(--muted)]"
-                              />
-                              <div className="flex gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => void saveProviderKey(provider.id)}
-                                  disabled={settingsBusy !== null && settingsBusy !== `key:${provider.id}`}
-                                  className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                                >
-                                  {settingsBusy === `key:${provider.id}` ? "Saving..." : "Save key"}
-                                </button>
-                                {hasStoredKey ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => void removeProviderKey(provider.id)}
-                                    disabled={settingsBusy !== null && settingsBusy !== `remove:${provider.id}`}
-                                    className="rounded-xl border border-red-500/20 px-4 py-2 text-sm font-medium text-red-500 transition-colors hover:bg-red-500/10 disabled:opacity-50"
-                                  >
-                                    {settingsBusy === `remove:${provider.id}` ? "Removing..." : "Remove"}
-                                  </button>
-                                ) : null}
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="space-y-4 rounded-xl border border-[var(--border)] bg-[var(--background)] p-4">
-                              <div className="flex items-center justify-between">
-                                <label className="text-sm font-medium">Enable Ollama</label>
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setOllamaConfig((current) => ({
-                                      ...current,
-                                      enabled: !current.enabled,
-                                    }))
-                                  }
-                                  className={cx(
-                                    "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors focus:outline-none",
-                                    ollamaConfig.enabled ? "bg-[var(--foreground)]" : "bg-[var(--muted)]",
-                                  )}
-                                >
-                                  <span className="sr-only">Toggle Ollama</span>
-                                  <span
-                                    aria-hidden="true"
-                                    className={cx(
-                                      "pointer-events-none absolute left-0 inline-block h-4 w-4 transform rounded-full bg-[var(--background)] shadow ring-0 transition-transform",
-                                      ollamaConfig.enabled ? "translate-x-4" : "translate-x-0",
-                                    )}
-                                  />
-                                </button>
-                              </div>
-
-                              <div className="space-y-2">
-                                <label className="text-xs text-[var(--muted)]">Base URL</label>
-                                <input
-                                  type="text"
-                                  placeholder="http://127.0.0.1:11434"
-                                  value={ollamaConfig.baseUrl}
-                                  onChange={(event) =>
-                                    setOllamaConfig((current) => ({
-                                      ...current,
-                                      baseUrl: event.target.value,
-                                    }))
-                                  }
-                                  className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-color)] px-4 py-2.5 text-sm outline-none transition-colors focus:border-[var(--muted)]"
-                                />
-                              </div>
-
-                              <div className="flex gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => void saveOllamaSettings()}
-                                  disabled={settingsBusy !== null && settingsBusy !== "ollama"}
-                                  className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                                >
-                                  {settingsBusy === "ollama" ? "Saving..." : "Save Ollama"}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => void fetchOllamaModels()}
-                                  disabled={ollamaModelsBusy}
-                                  className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-50"
-                                >
-                                  {ollamaModelsBusy ? "Fetching..." : "Fetch models"}
-                                </button>
-                              </div>
-
-                              {ollamaModelsError ? (
-                                <p className="text-xs text-red-500">{ollamaModelsError}</p>
-                              ) : null}
-
-                              {ollamaModels.length > 0 ? (
-                                <div className="space-y-2">
-                                  <p className="text-xs text-[var(--muted)]">Click a model to add it as a custom Ollama model:</p>
-                                  <div className="flex flex-wrap gap-2">
-                                    {ollamaModels.map((modelName) => {
-                                      const sel = createCustomModelSelection("ollama", modelName);
-                                      const key = serializeModelSelection(sel);
-                                      const alreadyAdded = customModels.some((m) => serializeModelSelection(m) === key);
-                                      return (
-                                        <button
-                                          key={modelName}
-                                          type="button"
-                                          disabled={alreadyAdded}
-                                          onClick={() => {
-                                            if (!alreadyAdded) setCustomModels((current) => [...current, sel]);
-                                          }}
-                                          className={cx(
-                                            "rounded-lg border px-2.5 py-1 text-xs transition-colors",
-                                            alreadyAdded
-                                              ? "border-[var(--border)] text-[var(--muted)] opacity-50 cursor-default"
-                                              : "border-[var(--border)] hover:border-[var(--foreground)] hover:bg-[var(--surface-muted)] cursor-pointer",
-                                          )}
-                                        >
-                                          {alreadyAdded ? "✓ " : "+ "}{modelName}
-                                        </button>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              ) : null}
-                            </div>
-                          )}
-
-                          <div className="flex flex-wrap gap-2">
-                            {provider.models.map((model) => (
-                              <span
-                                key={model.id}
-                                className="rounded-md border border-[var(--border)] bg-[var(--surface-color)] px-2 py-1 text-xs text-[var(--foreground)]/80"
-                              >
-                                {model.label}
-                              </span>
-                            ))}
-                          </div>
-
-                          <div className="flex items-center gap-2 pt-2">
-                            <input
-                              value={customDrafts[provider.id] || ""}
-                              onChange={(event) =>
-                                setCustomDrafts((current) => ({
-                                  ...current,
-                                  [provider.id]: event.target.value,
-                                }))
-                              }
-                              placeholder="Add custom model ID (e.g. gpt-4-turbo)"
-                              className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2 text-sm outline-none transition-colors focus:border-[var(--muted)]"
-                            />
-                            <button
-                              type="button"
-                              onClick={() => addCustomModel(provider.id)}
-                              className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90"
-                            >
-                              Add
-                            </button>
-                          </div>
-
-                          {providerModels.length > 0 ? (
-                            <div className="flex flex-wrap gap-2 pt-1">
-                              {providerModels.map((model) => (
-                                <button
-                                  key={serializeModelSelection(model)}
-                                  type="button"
-                                  onClick={() => removeCustomModel(model)}
-                                  className="rounded-md border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-xs transition-colors hover:border-red-500/50 hover:bg-red-500/10 hover:text-red-500"
-                                >
-                                  {model.modelId} ×
-                                </button>
-                              ))}
-                            </div>
-                          ) : null}
-                        </div>
-                      </div>
-                    );
-                  })}
+                <div className="mt-4 flex flex-wrap items-center gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
+                  <select
+                    value={language}
+                    onChange={(event) => setLanguage(event.target.value as Language)}
+                    className="flex-1 appearance-none rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
+                  >
+                    <option value="auto">{t.settings.languageAuto}</option>
+                    <option value="en">{t.settings.languageEn}</option>
+                    <option value="zh">{t.settings.languageZh}</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => void saveLanguageSettings()}
+                    disabled={settingsBusy !== null && settingsBusy !== "language"}
+                    className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                  >
+                    {settingsBusy === "language" ? t.settings.savingLanguage : t.settings.saveLanguage}
+                  </button>
                 </div>
               </section>
 
               <section className="space-y-4">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  GPS Routing
+                  {t.settings.providersAndModels}
+                </h3>
+                <div className="mt-4 flex items-center justify-between gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
+                  <div>
+                    <div className="font-medium text-[15px]">{t.settings.manageApiKeys}</div>
+                    <div className="mt-1 text-xs text-[var(--muted)]">{t.settings.manageApiKeysDesc}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveView("apikeys")}
+                    className="shrink-0 rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-muted)]"
+                  >
+                    {t.settings.goToApiKeys}
+                  </button>
+                </div>
+              </section>
+
+              <section className="space-y-4">
+                <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
+                  {t.settings.gpsRouting}
                 </h3>
 
                 {availableModels.length === 0 ? (
                   <p className="py-4 text-[15px] text-[var(--muted)]">
-                    Save at least one provider API key or enable Ollama above to unlock routing and conversation capabilities.
+                    {t.settings.gpsRoutingHint}
                   </p>
                 ) : (
                   <div className="mt-4 space-y-6 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
                     <p className="text-sm text-[var(--muted)]">
-                      Save your responder and synthesizer defaults so they load automatically after sign-in.
+                      {t.settings.routingDefaults}
                     </p>
                     <div>
-                      <label className="mb-3 block text-sm font-medium">Responders (up to 5)</label>
+                      <label className="mb-3 block text-sm font-medium">{t.settings.responders}</label>
                       <div className="flex flex-wrap gap-2">
                         {availableModels.map((model) => {
                           const selected = responderModels.some(
                             (entry) =>
                               serializeModelSelection(entry) === serializeModelSelection(model),
+                          );
+                          const providerTaken = !selected && responderModels.some(
+                            (entry) => entry.providerId === model.providerId,
                           );
                           return (
                             <button
@@ -2326,7 +2205,9 @@ export function LlmgpsShell() {
                                 "rounded-full border px-4 py-2 text-sm transition-colors",
                                 selected
                                   ? "border-[var(--foreground)] bg-[var(--foreground)] font-medium text-[var(--background)]"
-                                  : "border-[var(--border)] bg-[var(--background)] text-[var(--muted)] hover:border-[var(--muted)] hover:text-[var(--foreground)]",
+                                  : providerTaken
+                                    ? "border-[var(--border)] bg-[var(--background)] text-[var(--muted)] opacity-40 cursor-not-allowed"
+                                    : "border-[var(--border)] bg-[var(--background)] text-[var(--muted)] hover:border-[var(--muted)] hover:text-[var(--foreground)]",
                               )}
                             >
                               {model.label}
@@ -2337,7 +2218,7 @@ export function LlmgpsShell() {
                     </div>
 
                     <div className="pt-2">
-                      <label className="mb-3 block text-sm font-medium">Synthesizer Model</label>
+                      <label className="mb-3 block text-sm font-medium">{t.settings.synthesizerModel}</label>
                       <select
                         value={synthesizerModel ? serializeModelSelection(synthesizerModel) : ""}
                         onChange={(event) => {
@@ -2359,6 +2240,56 @@ export function LlmgpsShell() {
                       </select>
                     </div>
 
+                    <div className="pt-2">
+                      <label className="mb-1 block text-sm font-medium">{t.settings.searchQueryModel}</label>
+                      <p className="mb-2 text-xs text-[var(--muted)]">{t.settings.searchQueryModelDesc}</p>
+                      <select
+                        value={searchQueryModel ? serializeModelSelection(searchQueryModel) : ""}
+                        onChange={(event) => {
+                          const nextModel = availableModels.find(
+                            (model) => serializeModelSelection(model) === event.target.value,
+                          );
+                          setSearchQueryModel(nextModel ?? null);
+                        }}
+                        className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
+                      >
+                        <option value="">{t.settings.noModel}</option>
+                        {availableModels.map((model) => (
+                          <option
+                            key={serializeModelSelection(model)}
+                            value={serializeModelSelection(model)}
+                          >
+                            {model.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="pt-2">
+                      <label className="mb-1 block text-sm font-medium">{t.settings.compressionModelLabel}</label>
+                      <p className="mb-2 text-xs text-[var(--muted)]">{t.settings.compressionModelDesc}</p>
+                      <select
+                        value={compressionModel ? serializeModelSelection(compressionModel) : ""}
+                        onChange={(event) => {
+                          const nextModel = availableModels.find(
+                            (model) => serializeModelSelection(model) === event.target.value,
+                          );
+                          setCompressionModel(nextModel ?? null);
+                        }}
+                        className="w-full appearance-none rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-[15px] outline-none transition-colors focus:border-[var(--muted)]"
+                      >
+                        <option value="">{t.settings.usesSynthesizer}</option>
+                        {availableModels.map((model) => (
+                          <option
+                            key={serializeModelSelection(model)}
+                            value={serializeModelSelection(model)}
+                          >
+                            {model.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
                     <div className="flex justify-end pt-2">
                       <button
                         type="button"
@@ -2366,7 +2297,7 @@ export function LlmgpsShell() {
                         disabled={settingsBusy !== null && settingsBusy !== "routing"}
                         className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                       >
-                        {settingsBusy === "routing" ? "Saving defaults..." : "Save routing defaults"}
+                        {settingsBusy === "routing" ? t.settings.savingDefaults : t.settings.saveRoutingDefaults}
                       </button>
                     </div>
                   </div>
@@ -2375,15 +2306,15 @@ export function LlmgpsShell() {
 
               <section className="space-y-4 pb-6">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Context Compression
+                  {t.settings.contextCompression}
                 </h3>
 
                 <div className="mt-4 space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
                   <div className="flex items-center justify-between">
                     <div>
-                      <label className="text-sm font-medium">Enable Compression</label>
+                      <label className="text-sm font-medium">{t.settings.enableCompression}</label>
                       <p className="mt-0.5 text-xs text-[var(--muted)]">
-                        After each debate round, compress model opinions into a concise summary before synthesis.
+                        {t.settings.compressionDesc}
                       </p>
                     </div>
                     <button
@@ -2407,9 +2338,9 @@ export function LlmgpsShell() {
                     <>
                       <div className="flex items-center justify-between">
                         <div>
-                          <label className="text-sm font-medium">Rolling Context</label>
+                          <label className="text-sm font-medium">{t.settings.rollingContext}</label>
                           <p className="mt-0.5 text-xs text-[var(--muted)]">
-                            Use only the compressed summary as context for the next message instead of full history.
+                            {t.settings.rollingContextDesc}
                           </p>
                         </div>
                         <button
@@ -2431,9 +2362,9 @@ export function LlmgpsShell() {
 
                       <div className="flex items-center justify-between gap-4">
                         <div>
-                          <label className="text-sm font-medium">Target Token Budget</label>
+                          <label className="text-sm font-medium">{t.settings.targetTokenBudget}</label>
                           <p className="mt-0.5 text-xs text-[var(--muted)]">
-                            Approximate token target for the compressed summary (default: 1500).
+                            {t.settings.targetTokenDesc}
                           </p>
                         </div>
                         <input
@@ -2446,16 +2377,17 @@ export function LlmgpsShell() {
                           className="w-24 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-right text-sm"
                         />
                       </div>
+
                     </>
                   )}
 
                   {compressionHistory.length > 0 && (
                     <div className="space-y-1.5 border-t border-[var(--border)] pt-3">
-                      <p className="text-xs font-medium text-[var(--muted)]">Compression history this session</p>
+                      <p className="text-xs font-medium text-[var(--muted)]">{t.settings.compressionHistoryTitle}</p>
                       {compressionHistory.map((round) => (
                         <div key={round.roundNumber} className="flex items-center justify-between text-xs text-[var(--muted)]">
-                          <span>Round {round.roundNumber}</span>
-                          <span>{round.originalTokenEstimate} → {round.compressedTokenEstimate} tokens</span>
+                          <span>{t.settings.round} {round.roundNumber}</span>
+                          <span>{round.originalTokenEstimate} → {round.compressedTokenEstimate} {t.settings.tokens}</span>
                         </div>
                       ))}
                     </div>
@@ -2468,7 +2400,7 @@ export function LlmgpsShell() {
                       disabled={settingsBusy !== null && settingsBusy !== "routing"}
                       className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                     >
-                      {settingsBusy === "routing" ? "Saving..." : "Save compression defaults"}
+                      {settingsBusy === "routing" ? t.settings.savingCompression : t.settings.saveCompression}
                     </button>
                   </div>
                 </div>
@@ -2476,12 +2408,12 @@ export function LlmgpsShell() {
 
               <section className="space-y-4 pb-20">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Network Proxy
+                  {t.settings.networkProxy}
                 </h3>
 
                 <div className="mt-4 space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
                   <div className="flex items-center justify-between">
-                    <label className="text-sm font-medium">Enable Proxy</label>
+                    <label className="text-sm font-medium">{t.settings.enableProxy}</label>
                     <button
                       type="button"
                       onClick={() =>
@@ -2492,7 +2424,7 @@ export function LlmgpsShell() {
                         proxyConfig.enabled ? "bg-[var(--foreground)]" : "bg-[var(--muted)]",
                       )}
                     >
-                      <span className="sr-only">Use proxy</span>
+                      <span className="sr-only">{t.settings.useProxy}</span>
                       <span
                         aria-hidden="true"
                         className={cx(
@@ -2507,7 +2439,7 @@ export function LlmgpsShell() {
                     <div className="mt-4 grid gap-4 animate-in fade-in slide-in-from-top-2">
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <label className="mb-1 block text-xs text-[var(--muted)]">Protocol</label>
+                          <label className="mb-1 block text-xs text-[var(--muted)]">{t.settings.protocol}</label>
                           <select
                             value={proxyConfig.type}
                             onChange={(event) =>
@@ -2518,16 +2450,16 @@ export function LlmgpsShell() {
                             }
                             className="w-full appearance-none rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus:border-[var(--muted)]"
                           >
-                            <option value="none">Disabled</option>
-                            <option value="http">HTTP / HTTPS</option>
-                            <option value="socks5">SOCKS5</option>
+                            <option value="none">{t.settings.proxyDisabled}</option>
+                            <option value="http">{t.settings.proxyHttp}</option>
+                            <option value="socks5">{t.settings.proxySocks5}</option>
                           </select>
                         </div>
                       </div>
 
                       <div className="grid grid-cols-[1fr_auto] gap-4">
                         <div>
-                          <label className="mb-1 block text-xs text-[var(--muted)]">Host / IP</label>
+                          <label className="mb-1 block text-xs text-[var(--muted)]">{t.settings.hostIp}</label>
                           <input
                             type="text"
                             placeholder="127.0.0.1"
@@ -2542,7 +2474,7 @@ export function LlmgpsShell() {
                           />
                         </div>
                         <div className="w-24">
-                          <label className="mb-1 block text-xs text-[var(--muted)]">Port</label>
+                          <label className="mb-1 block text-xs text-[var(--muted)]">{t.settings.port}</label>
                           <input
                             type="text"
                             placeholder="1080"
@@ -2561,7 +2493,7 @@ export function LlmgpsShell() {
                       <div className="grid grid-cols-2 gap-4">
                         <div>
                           <label className="mb-1 block text-xs text-[var(--muted)]">
-                            Username (Optional)
+                            {t.settings.usernameOptional}
                           </label>
                           <input
                             type="text"
@@ -2579,7 +2511,7 @@ export function LlmgpsShell() {
                         </div>
                         <div>
                           <label className="mb-1 block text-xs text-[var(--muted)]">
-                            Password (Optional)
+                            {t.settings.passwordOptional}
                           </label>
                           <input
                             type="password"
@@ -2605,22 +2537,22 @@ export function LlmgpsShell() {
                     disabled={settingsBusy !== null && settingsBusy !== "proxy"}
                     className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
-                    {settingsBusy === "proxy" ? "Saving proxy..." : "Save proxy settings"}
+                    {settingsBusy === "proxy" ? t.settings.savingProxy : t.settings.saveProxy}
                   </button>
                 </div>
               </section>
 
               <section className="space-y-4 pb-20">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Web Search
+                  {t.settings.webSearch}
                 </h3>
 
                 <div className="mt-4 space-y-4 rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5">
                   <div className="flex items-center justify-between">
                     <div>
-                      <label className="text-sm font-medium">Enable Web Search</label>
+                      <label className="text-sm font-medium">{t.settings.enableWebSearch}</label>
                       <p className="text-xs text-[var(--muted)]">
-                        Fetch live web results and inject them as context before each LLM call.
+                        {t.settings.webSearchDesc}
                       </p>
                     </div>
                     <button
@@ -2646,7 +2578,7 @@ export function LlmgpsShell() {
                     <div className="space-y-4">
                       <div>
                         <label className="mb-1 block text-xs text-[var(--muted)]">
-                          Search Provider
+                          {t.settings.searchProvider}
                         </label>
                         <select
                           value={webSearchConfig.provider}
@@ -2658,13 +2590,13 @@ export function LlmgpsShell() {
                           }
                           className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm outline-none focus:border-[var(--muted)]"
                         >
-                          <option value="brave">Brave Search</option>
-                          <option value="tavily">Tavily</option>
+                          <option value="brave">{t.settings.braveSearch}</option>
+                          <option value="tavily">{t.settings.tavily}</option>
                         </select>
                       </div>
                       <div>
                         <label className="mb-1 block text-xs text-[var(--muted)]">
-                          {webSearchConfig.provider === "brave" ? "Brave API Key" : "Tavily API Key"}
+                          {webSearchConfig.provider === "brave" ? t.settings.braveApiKey : t.settings.tavilyApiKey}
                         </label>
                         <input
                           type="password"
@@ -2699,7 +2631,7 @@ export function LlmgpsShell() {
                       </div>
                       <div>
                         <label className="mb-1 block text-xs text-[var(--muted)]">
-                          Max Results (1–10)
+                          {t.settings.maxResults}
                         </label>
                         <input
                           type="number"
@@ -2724,10 +2656,315 @@ export function LlmgpsShell() {
                     disabled={settingsBusy !== null && settingsBusy !== "websearch"}
                     className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
-                    {settingsBusy === "websearch" ? "Saving..." : "Save web search settings"}
+                    {settingsBusy === "websearch" ? t.settings.savingWebSearch : t.settings.saveWebSearch}
                   </button>
                 </div>
               </section>
+            </div>
+          </div>
+        ) : null}
+
+        {activeView === "apikeys" ? (
+          <div key="view-apikeys" className="panel-fade-in h-full overflow-y-auto">
+            <div className="mx-auto w-full max-w-3xl space-y-10 px-6 py-10">
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setActiveView("settings")}
+                  className="text-sm text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
+                >
+                  {t.settings.apiKeysBackBtn}
+                </button>
+              </div>
+              <div className="space-y-3">
+                <h2 className="text-2xl font-semibold">{t.settings.apiKeysTitle}</h2>
+                <p className="text-[15px] text-[var(--muted)]">{t.settings.apiKeysDesc}</p>
+                {settingsNotice ? (
+                  <div className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-600">
+                    {settingsNotice}
+                  </div>
+                ) : null}
+                {error ? (
+                  <div className="rounded-2xl border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-500">
+                    {error}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="grid gap-4">
+                {PROVIDER_PRESETS.map((provider) => {
+                  const providerModels = customModels.filter(
+                    (model) => model.providerId === provider.id,
+                  );
+                  const hasStoredKey = provider.authStrategy === "api-key" && configuredProviders.has(provider.id);
+                  const hasOllamaEnabled = provider.id === "ollama" && ollamaConfig.enabled;
+                  const providerDisplayName = (t.providers as Record<string, string>)[provider.id] || provider.name;
+
+                  return (
+                    <div
+                      key={provider.id}
+                      className="rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-5"
+                    >
+                      <div className="mb-4 flex items-center justify-between gap-4">
+                        <div>
+                          <div className="font-medium text-[15px]">{providerDisplayName}</div>
+                          <div className="mt-1 text-xs text-[var(--muted)]">
+                            {provider.id === "ollama"
+                              ? hasOllamaEnabled
+                                ? t.settings.ollamaEnabled
+                                : t.settings.ollamaDisabled
+                              : hasStoredKey
+                                ? t.settings.apiKeyStored
+                                : t.settings.noApiKey}
+                          </div>
+                        </div>
+                        {provider.docsUrl ? (
+                          <a
+                            href={provider.docsUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-xs text-[var(--muted)] underline transition-colors hover:text-[var(--foreground)]"
+                          >
+                            {t.settings.docs}
+                          </a>
+                        ) : null}
+                      </div>
+
+                      <div className="space-y-4">
+                        {provider.id === "custom" ? (
+                          <div className="space-y-3 rounded-xl border border-[var(--border)] bg-[var(--background)] p-4">
+                            <div className="space-y-2">
+                              <label className="text-xs text-[var(--muted)]">{t.settings.customEndpointUrl}</label>
+                              <input
+                                type="text"
+                                placeholder={t.settings.customEndpointUrlPlaceholder}
+                                value={customEndpointConfig.baseUrl}
+                                onChange={(event) =>
+                                  setCustomEndpointConfig({ baseUrl: event.target.value })
+                                }
+                                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-color)] px-4 py-2.5 text-sm outline-none transition-colors focus:border-[var(--muted)]"
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void saveCustomEndpointSettings()}
+                              disabled={settingsBusy !== null && settingsBusy !== "custom-endpoint"}
+                              className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                            >
+                              {settingsBusy === "custom-endpoint" ? t.settings.savingEndpoint : t.settings.saveEndpoint}
+                            </button>
+                          </div>
+                        ) : null}
+
+                        {provider.authStrategy === "api-key" ? (
+                          <div className="flex flex-col gap-3 sm:flex-row">
+                            <input
+                              type="password"
+                              autoComplete="off"
+                              placeholder={
+                                hasStoredKey
+                                  ? t.settings.apiKeyStoredPlaceholder
+                                  : provider.apiKeyPlaceholder
+                              }
+                              value={apiKeyDrafts[provider.id]}
+                              onChange={(event) =>
+                                setApiKeyDrafts((current) => ({
+                                  ...current,
+                                  [provider.id]: event.target.value,
+                                }))
+                              }
+                              className="w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2.5 text-sm outline-none transition-colors focus:border-[var(--muted)]"
+                            />
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void saveProviderKey(provider.id)}
+                                disabled={settingsBusy !== null && settingsBusy !== `key:${provider.id}`}
+                                className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                              >
+                                {settingsBusy === `key:${provider.id}` ? t.settings.saving : t.settings.saveKey}
+                              </button>
+                              {hasStoredKey ? (
+                                <button
+                                  type="button"
+                                  onClick={() => void removeProviderKey(provider.id)}
+                                  disabled={settingsBusy !== null && settingsBusy !== `remove:${provider.id}`}
+                                  className="rounded-xl border border-red-500/20 px-4 py-2 text-sm font-medium text-red-500 transition-colors hover:bg-red-500/10 disabled:opacity-50"
+                                >
+                                  {settingsBusy === `remove:${provider.id}` ? t.settings.removing : t.settings.remove}
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="space-y-4 rounded-xl border border-[var(--border)] bg-[var(--background)] p-4">
+                            <div className="flex items-center justify-between">
+                              <label className="text-sm font-medium">{t.settings.enableOllama}</label>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOllamaConfig((current) => ({
+                                    ...current,
+                                    enabled: !current.enabled,
+                                  }))
+                                }
+                                className={cx(
+                                  "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors focus:outline-none",
+                                  ollamaConfig.enabled ? "bg-[var(--foreground)]" : "bg-[var(--muted)]",
+                                )}
+                              >
+                                <span className="sr-only">{t.settings.toggleOllama}</span>
+                                <span
+                                  aria-hidden="true"
+                                  className={cx(
+                                    "pointer-events-none absolute left-0 inline-block h-4 w-4 transform rounded-full bg-[var(--background)] shadow ring-0 transition-transform",
+                                    ollamaConfig.enabled ? "translate-x-4" : "translate-x-0",
+                                  )}
+                                />
+                              </button>
+                            </div>
+
+                            <div className="flex items-center justify-between">
+                              <div>
+                                <label className="text-sm font-medium">{t.settings.ollamaBypassProxy}</label>
+                                <p className="mt-0.5 text-xs text-[var(--muted)]">{t.settings.ollamaBypassProxyDesc}</p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOllamaConfig((current) => ({
+                                    ...current,
+                                    bypassProxy: !current.bypassProxy,
+                                  }))
+                                }
+                                className={cx(
+                                  "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full transition-colors focus:outline-none",
+                                  ollamaConfig.bypassProxy ? "bg-[var(--foreground)]" : "bg-[var(--muted)]",
+                                )}
+                              >
+                                <span className="sr-only">{t.settings.ollamaBypassProxy}</span>
+                                <span
+                                  aria-hidden="true"
+                                  className={cx(
+                                    "pointer-events-none absolute left-0 inline-block h-4 w-4 transform rounded-full bg-[var(--background)] shadow ring-0 transition-transform",
+                                    ollamaConfig.bypassProxy ? "translate-x-4" : "translate-x-0",
+                                  )}
+                                />
+                              </button>
+                            </div>
+
+                            <div className="space-y-2">
+                              <label className="text-xs text-[var(--muted)]">{t.settings.baseUrl}</label>
+                              <input
+                                type="text"
+                                placeholder="http://127.0.0.1:11434"
+                                value={ollamaConfig.baseUrl}
+                                onChange={(event) =>
+                                  setOllamaConfig((current) => ({
+                                    ...current,
+                                    baseUrl: event.target.value,
+                                  }))
+                                }
+                                className="w-full rounded-xl border border-[var(--border)] bg-[var(--surface-color)] px-4 py-2.5 text-sm outline-none transition-colors focus:border-[var(--muted)]"
+                              />
+                            </div>
+
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void saveOllamaSettings()}
+                                disabled={settingsBusy !== null && settingsBusy !== "ollama"}
+                                className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                              >
+                                {settingsBusy === "ollama" ? t.settings.saving : t.settings.saveOllama}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void fetchOllamaModels()}
+                                disabled={ollamaModelsBusy}
+                                className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] transition-colors hover:bg-[var(--surface-muted)] disabled:opacity-50"
+                              >
+                                {ollamaModelsBusy ? t.settings.fetchingModels : t.settings.fetchModels}
+                              </button>
+                            </div>
+
+                            {ollamaModelsError ? (
+                              <p className="text-xs text-red-500">{ollamaModelsError}</p>
+                            ) : null}
+
+                            {ollamaModels.length > 0 ? (
+                              <div className="space-y-2">
+                                <p className="text-xs text-[var(--muted)]">{t.settings.ollamaModelsHint}</p>
+                                <div className="flex flex-wrap gap-2">
+                                  {ollamaModels.map((modelName) => {
+                                    const sel = createCustomModelSelection("ollama", modelName);
+                                    const key = serializeModelSelection(sel);
+                                    const alreadyAdded = customModels.some((m) => serializeModelSelection(m) === key);
+                                    return (
+                                      <button
+                                        key={modelName}
+                                        type="button"
+                                        disabled={alreadyAdded}
+                                        onClick={() => {
+                                          if (!alreadyAdded) setCustomModels((current) => [...current, sel]);
+                                        }}
+                                        className={cx(
+                                          "rounded-lg border px-2.5 py-1 text-xs transition-colors",
+                                          alreadyAdded
+                                            ? "border-[var(--border)] text-[var(--muted)] opacity-50 cursor-default"
+                                            : "border-[var(--border)] hover:border-[var(--foreground)] hover:bg-[var(--surface-muted)] cursor-pointer",
+                                        )}
+                                      >
+                                        {alreadyAdded ? "✓ " : "+ "}{modelName}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        )}
+
+                        <div className="flex items-center gap-2 pt-2">
+                          <input
+                            value={customDrafts[provider.id] || ""}
+                            onChange={(event) =>
+                              setCustomDrafts((current) => ({
+                                ...current,
+                                [provider.id]: event.target.value,
+                              }))
+                            }
+                            placeholder={t.settings.addModelPlaceholder}
+                            className="flex-1 rounded-xl border border-[var(--border)] bg-[var(--background)] px-4 py-2 text-sm outline-none transition-colors focus:border-[var(--muted)]"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => addCustomModel(provider.id)}
+                            className="rounded-xl bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity hover:opacity-90"
+                          >
+                            {t.settings.addCustomModel}
+                          </button>
+                        </div>
+
+                        {providerModels.length > 0 ? (
+                          <div className="flex flex-wrap gap-2 pt-1">
+                            {providerModels.map((model) => (
+                              <button
+                                key={serializeModelSelection(model)}
+                                type="button"
+                                onClick={() => removeCustomModel(model)}
+                                className="rounded-md border border-[var(--border)] bg-[var(--background)] px-2 py-1 text-xs transition-colors hover:border-red-500/50 hover:bg-red-500/10 hover:text-red-500"
+                              >
+                                {model.modelId} ×
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </div>
         ) : null}
@@ -2737,9 +2974,9 @@ export function LlmgpsShell() {
             <div className="mx-auto w-full max-w-3xl space-y-8 px-6 py-10 pb-20">
               <div className="flex items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-2xl font-semibold">Chat History</h2>
+                  <h2 className="text-2xl font-semibold">{t.history.title}</h2>
                   <p className="mt-1 text-[15px] text-[var(--muted)]">
-                    Saved conversations live in the encrypted SQLite store and can be reopened here.
+                    {t.history.desc}
                   </p>
                 </div>
                 <button
@@ -2750,7 +2987,7 @@ export function LlmgpsShell() {
                   }}
                   className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
                 >
-                  New chat
+                  {t.history.newChat}
                 </button>
               </div>
 
@@ -2762,14 +2999,14 @@ export function LlmgpsShell() {
 
               <section className="space-y-4">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Conversations
+                  {t.history.conversations}
                 </h3>
 
                 {conversationHistory.length === 0 ? (
                   <div className="rounded-2xl border border-[var(--border)] bg-[var(--surface-subtle)] p-8 text-center text-[15px] text-[var(--muted)]">
                     {historyBusy === "list"
-                      ? "Loading saved conversations..."
-                      : "No saved conversations yet. Send a prompt in chat to create one."}
+                      ? t.history.loading
+                      : t.history.empty}
                   </div>
                 ) : (
                   <div className="space-y-3">
@@ -2798,10 +3035,10 @@ export function LlmgpsShell() {
                               </div>
                             </div>
                             <div className="mt-2 line-clamp-2 text-sm text-[var(--muted)]">
-                              {conversation.preview || "No preview available yet."}
+                              {conversation.preview || t.history.noPreview}
                             </div>
                             <div className="mt-3 text-xs uppercase tracking-[0.2em] text-[var(--muted)]">
-                              {conversation.messageCount} saved messages
+                              {t.history.savedMessages(conversation.messageCount)}
                             </div>
                           </button>
 
@@ -2811,7 +3048,7 @@ export function LlmgpsShell() {
                             disabled={historyBusy === `delete:${conversation.id}`}
                             className="rounded-xl border border-red-500/20 px-3 py-2 text-xs text-red-500 transition-colors hover:bg-red-500/10 disabled:opacity-50"
                           >
-                            {historyBusy === `delete:${conversation.id}` ? "Deleting..." : "Delete"}
+                            {historyBusy === `delete:${conversation.id}` ? t.history.deleting : t.history.delete}
                           </button>
                         </div>
                       );
@@ -2822,7 +3059,7 @@ export function LlmgpsShell() {
 
               <section className="space-y-4">
                 <h3 className="border-b border-[var(--border)] pb-2 text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
-                  Selected Run
+                  {t.history.selectedRun}
                 </h3>
 
                 {lastRun ? (
@@ -2899,14 +3136,14 @@ export function LlmgpsShell() {
       {synthRetryOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
           <div className="mx-4 w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--background)] p-6 shadow-2xl">
-            <h2 className="text-lg font-semibold">Synthesis Failed</h2>
+            <h2 className="text-lg font-semibold">{t.synthesis.failed}</h2>
             {synthRetryError ? (
               <p className="mt-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-400">
                 {synthRetryError}
               </p>
             ) : null}
             <p className="mt-3 text-sm text-[var(--muted)]">
-              Choose a different model and retry synthesis. Your opinions are preserved above.
+              {t.synthesis.retryDesc}
             </p>
 
             <div className="mt-4 space-y-1">
@@ -2943,7 +3180,7 @@ export function LlmgpsShell() {
                 }}
                 className="rounded-lg px-4 py-2 text-sm text-[var(--muted)] transition-colors hover:text-[var(--foreground)]"
               >
-                Dismiss
+                {t.synthesis.dismiss}
               </button>
               <button
                 type="button"
@@ -2951,7 +3188,7 @@ export function LlmgpsShell() {
                 onClick={() => void retrySynthesis()}
                 className="rounded-lg bg-[var(--foreground)] px-4 py-2 text-sm font-medium text-[var(--background)] transition-opacity disabled:opacity-40"
               >
-                {synthRetryBusy ? "Synthesizing…" : "Retry Synthesis"}
+                {synthRetryBusy ? t.synthesis.synthesizing : t.synthesis.retrySynthesis}
               </button>
             </div>
           </div>

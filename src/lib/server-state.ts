@@ -15,15 +15,20 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   buildProxyUrl,
+  defaultCustomEndpointConfig,
   defaultOllamaConfig,
   defaultRoutingPreferences,
   defaultProxyConfig,
   defaultWebSearchConfig,
+  sanitizeCustomEndpointConfig,
+  sanitizeLanguage,
   sanitizeOllamaConfig,
   sanitizeRoutingPreferences,
   sanitizeProxyConfig,
   sanitizeWebSearchConfig,
   type AppStatusPayload,
+  type CustomEndpointConfig,
+  type Language,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
@@ -46,6 +51,8 @@ type PasswordRecord = {
 
 type OwnerRecord = {
   apiKeys: Partial<Record<ProviderId, string>>;
+  customEndpointConfig: CustomEndpointConfig;
+  language: Language;
   ollamaConfig: OllamaConfig;
   password: PasswordRecord;
   proxyConfig: ProxyConfig;
@@ -62,6 +69,8 @@ type StoreRecord = {
 
 type OwnerSecrets = {
   apiKeys: Partial<Record<ProviderId, string>>;
+  customEndpointConfig?: CustomEndpointConfig;
+  language?: Language;
   ollamaConfig: OllamaConfig;
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
@@ -90,6 +99,8 @@ type LegacyStoreFile = {
 
 type SettingsUpdate = {
   apiKeys?: Partial<Record<ProviderId, string | null>>;
+  customEndpointConfig?: CustomEndpointConfig;
+  language?: Language;
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
@@ -406,6 +417,8 @@ function runInTransaction<T>(database: DatabaseSync, callback: () => T) {
 async function encryptSecrets(secrets: OwnerSecrets) {
   const payload = {
     apiKeys: sanitizeApiKeys(secrets.apiKeys),
+    customEndpointConfig: sanitizeCustomEndpointConfig(secrets.customEndpointConfig),
+    language: sanitizeLanguage(secrets.language),
     ollamaConfig: sanitizeOllamaConfig(secrets.ollamaConfig),
     proxyConfig: sanitizeProxyConfig(secrets.proxyConfig),
     routingPreferences: sanitizeRoutingPreferences(secrets.routingPreferences),
@@ -441,6 +454,8 @@ async function decryptSecrets(rawEnvelope: string): Promise<OwnerSecrets> {
 
   return {
     apiKeys: sanitizeApiKeys(payload.apiKeys),
+    customEndpointConfig: sanitizeCustomEndpointConfig(payload.customEndpointConfig),
+    language: sanitizeLanguage(payload.language),
     ollamaConfig: sanitizeOllamaConfig(payload.ollamaConfig),
     proxyConfig: sanitizeProxyConfig(payload.proxyConfig),
     routingPreferences: sanitizeRoutingPreferences(payload.routingPreferences),
@@ -506,6 +521,8 @@ async function readLegacyStore(legacyJsonPath: string) {
       owner: parsed.owner
         ? {
             apiKeys: sanitizeApiKeys(parsed.owner.apiKeys),
+            customEndpointConfig: { ...defaultCustomEndpointConfig },
+            language: "auto" as const,
             ollamaConfig: { ...defaultOllamaConfig },
             password: parsed.owner.password ?? { hash: "", salt: "" },
             proxyConfig: sanitizeProxyConfig(parsed.owner.proxyConfig),
@@ -605,6 +622,8 @@ async function readStore() {
   return {
     owner: {
       apiKeys: sanitizeApiKeys(secrets.apiKeys),
+      customEndpointConfig: sanitizeCustomEndpointConfig(secrets.customEndpointConfig),
+      language: sanitizeLanguage(secrets.language),
       ollamaConfig: sanitizeOllamaConfig(secrets.ollamaConfig),
       password: {
         hash: row.password_hash,
@@ -624,6 +643,8 @@ async function writeOwner(owner: OwnerRecord, sessionSecret: string) {
   const database = await getDatabase();
   const encryptedSecrets = await encryptSecrets({
     apiKeys: owner.apiKeys,
+    customEndpointConfig: owner.customEndpointConfig,
+    language: owner.language,
     ollamaConfig: owner.ollamaConfig,
     proxyConfig: owner.proxyConfig,
     routingPreferences: owner.routingPreferences,
@@ -677,7 +698,9 @@ export async function getAppStatus(username: string | null): Promise<AppStatusPa
   return {
     authenticated,
     configuredProviders,
+    customEndpointConfig: authenticated ? owner?.customEndpointConfig ?? { ...defaultCustomEndpointConfig } : { ...defaultCustomEndpointConfig },
     initialized: Boolean(owner),
+    language: authenticated ? owner?.language ?? "auto" : "auto",
     ollamaConfig: authenticated ? owner?.ollamaConfig ?? { ...defaultOllamaConfig } : { ...defaultOllamaConfig },
     proxyConfig: authenticated ? owner?.proxyConfig ?? { ...defaultProxyConfig } : { ...defaultProxyConfig },
     routingPreferences: authenticated
@@ -705,6 +728,8 @@ export async function initializeOwner(username: string, password: string) {
   await writeOwner(
     {
       apiKeys: {},
+      customEndpointConfig: { ...defaultCustomEndpointConfig },
+      language: "auto",
       ollamaConfig: { ...defaultOllamaConfig },
       password: hashPassword(normalizedPassword),
       proxyConfig: { ...defaultProxyConfig },
@@ -789,6 +814,14 @@ export async function saveOwnerSettings(update: SettingsUpdate) {
     });
   }
 
+  if (update.language !== undefined) {
+    owner.language = sanitizeLanguage(update.language);
+  }
+
+  if (update.customEndpointConfig !== undefined) {
+    owner.customEndpointConfig = sanitizeCustomEndpointConfig(update.customEndpointConfig);
+  }
+
   await writeOwner(owner, store.sessionSecret);
 
   return {
@@ -819,9 +852,11 @@ export async function getExecutionSettings() {
 
   return {
     apiKeys: store.owner.apiKeys,
+    customEndpointBaseUrl: store.owner.customEndpointConfig.baseUrl,
     ollamaBaseUrl: store.owner.ollamaConfig.enabled
       ? store.owner.ollamaConfig.baseUrl.trim() || defaultOllamaConfig.baseUrl
       : undefined,
+    ollamaBypassProxy: store.owner.ollamaConfig.bypassProxy,
     proxyUrl: buildProxyUrl(store.owner.proxyConfig),
     webSearchConfig: store.owner.webSearchConfig,
   };

@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import {
+  sanitizeCustomEndpointConfig,
+  sanitizeLanguage,
   sanitizeOllamaConfig,
   sanitizeProxyConfig,
   sanitizeRoutingPreferences,
   sanitizeWebSearchConfig,
+  type CustomEndpointConfig,
+  type Language,
   type OllamaConfig,
   type ProxyConfig,
   type RoutingPreferencesPayload,
@@ -17,6 +21,8 @@ import type { ProviderId } from "@/lib/llm";
 
 type SettingsPayload = {
   apiKeys?: Partial<Record<ProviderId, string | null>>;
+  customEndpointConfig?: Partial<CustomEndpointConfig>;
+  language?: Language;
   ollamaConfig?: Partial<OllamaConfig>;
   proxyConfig?: Partial<ProxyConfig>;
   routingPreferences?: Partial<RoutingPreferencesPayload>;
@@ -45,6 +51,8 @@ export async function POST(request: NextRequest) {
     const payload = (await request.json()) as SettingsPayload;
     await saveOwnerSettings({
       apiKeys: payload.apiKeys,
+      customEndpointConfig: payload.customEndpointConfig ? sanitizeCustomEndpointConfig(payload.customEndpointConfig) : undefined,
+      language: payload.language !== undefined ? sanitizeLanguage(payload.language) : undefined,
       ollamaConfig: payload.ollamaConfig ? sanitizeOllamaConfig(payload.ollamaConfig) : undefined,
       proxyConfig: payload.proxyConfig ? sanitizeProxyConfig(payload.proxyConfig) : undefined,
       routingPreferences: payload.routingPreferences

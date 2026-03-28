@@ -32,18 +32,22 @@ export type ApiKeyMap = Partial<Record<ModelSelection["providerId"], string>>;
 
 export type ClientGpsRequestPayload = {
   compressionConfig?: CompressionConfig | null;
+  compressionModel?: ModelSelection | null;
   gpsMode: boolean;
   debateMode?: boolean;
   messages: ChatMessage[];
   previousCompressedContext?: string | null;
   responderModels: ModelSelection[];
+  searchQueryModel?: ModelSelection | null;
   synthesizerModel?: ModelSelection | null;
   webSearchEnabled?: boolean;
 };
 
 export type GpsExecutionPayload = ClientGpsRequestPayload & {
   apiKeys: ApiKeyMap;
+  customEndpointBaseUrl?: string;
   ollamaBaseUrl?: string;
+  ollamaBypassProxy?: boolean;
   proxyUrl?: string;
   webSearchConfig?: WebSearchConfig;
 };
@@ -208,25 +212,103 @@ function buildSearchContextBlock(results: WebSearchResult[]): string {
   return `[Web Search Results — ${new Date().toISOString().slice(0, 10)}]\n${lines.join("\n")}`;
 }
 
+const SEARCH_QUERY_GENERATION_PROMPT = `You are a search query generator. Given the user's message, produce focused web search queries to gather relevant, up-to-date information.
+
+Rules:
+- Output ONLY a JSON array of query strings — no explanation, preamble, or extra text
+- Maximum 5 queries
+- Each query must be concise (under 10 words), specific, and independently searchable
+- Cover different aspects of the topic
+
+Example output: ["Claude AI model comparison 2025", "LLM benchmark results latest", "transformer architecture improvements"]`;
+
+async function generateSearchQueries(
+  userMessage: string,
+  searchQueryModel: ModelSelection,
+  apiKeys: ApiKeyMap,
+  ollamaBaseUrl?: string,
+  proxyUrl?: string,
+  customEndpointBaseUrl?: string,
+): Promise<string[]> {
+  try {
+    const apiKey = getRequiredProviderSecret(searchQueryModel, apiKeys);
+    const response = await sendModelMessage(
+      searchQueryModel,
+      apiKey,
+      [{ role: "user", content: `${SEARCH_QUERY_GENERATION_PROMPT}\n\nUser message: ${userMessage.slice(0, 800)}` }],
+      ollamaBaseUrl,
+      proxyUrl,
+      customEndpointBaseUrl,
+    );
+    const jsonMatch = response.match(/\[[\s\S]*?\]/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]) as unknown;
+      if (Array.isArray(parsed)) {
+        const queries = (parsed as unknown[])
+          .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+          .map((q) => q.trim())
+          .slice(0, 5);
+        if (queries.length > 0) return queries;
+      }
+    }
+  } catch {
+    // fall through to default
+  }
+  return [userMessage.slice(0, 200)];
+}
+
 async function maybeInjectWebSearch(
   messages: ChatMessage[],
   config: WebSearchConfig | undefined,
   proxyUrl?: string,
-): Promise<{ messages: ChatMessage[]; searched: boolean; results: WebSearchResult[] }> {
+  searchQueryModel?: ModelSelection | null,
+  apiKeys?: ApiKeyMap,
+  ollamaBaseUrl?: string,
+  customEndpointBaseUrl?: string,
+): Promise<{ messages: ChatMessage[]; searched: boolean; results: WebSearchResult[]; queries: string[] }> {
   if (!config?.enabled || !config.apiKey?.trim()) {
-    return { messages, searched: false, results: [] };
+    return { messages, searched: false, results: [], queries: [] };
   }
 
   const lastUserMessage = [...messages].reverse().find((m) => m.role === "user");
   if (!lastUserMessage) {
-    return { messages, searched: false, results: [] };
+    return { messages, searched: false, results: [], queries: [] };
   }
 
   try {
-    const results = await fetchWebSearchResults(lastUserMessage.content, config, proxyUrl);
-    const block = buildSearchContextBlock(results);
+    // Generate queries via model, or fall back to raw user message
+    const queries: string[] = searchQueryModel && apiKeys
+      ? await generateSearchQueries(
+          lastUserMessage.content,
+          searchQueryModel,
+          apiKeys,
+          ollamaBaseUrl,
+          proxyUrl,
+          customEndpointBaseUrl,
+        )
+      : [lastUserMessage.content.slice(0, 200)];
+
+    // Search each query and collect results (deduplicated by URL)
+    const seenUrls = new Set<string>();
+    const allResults: WebSearchResult[] = [];
+
+    for (const query of queries) {
+      try {
+        const results = await fetchWebSearchResults(query, config, proxyUrl);
+        for (const r of results) {
+          if (r.url && !seenUrls.has(r.url)) {
+            seenUrls.add(r.url);
+            allResults.push(r);
+          }
+        }
+      } catch {
+        // skip failed queries
+      }
+    }
+
+    const block = buildSearchContextBlock(allResults);
     if (!block) {
-      return { messages, searched: false, results: [] };
+      return { messages, searched: false, results: [], queries };
     }
 
     return {
@@ -236,10 +318,11 @@ async function maybeInjectWebSearch(
         ...messages,
       ],
       searched: true,
-      results,
+      results: allResults,
+      queries,
     };
   } catch {
-    return { messages, searched: false, results: [] };
+    return { messages, searched: false, results: [], queries: [] };
   }
 }
 
@@ -265,7 +348,7 @@ function buildOpinionMessages(messages: ChatMessage[]) {
   });
 }
 
-function getOpenAICompatibleBaseUrl(providerId: ModelSelection["providerId"]) {
+function getOpenAICompatibleBaseUrl(providerId: ModelSelection["providerId"], customEndpointBaseUrl?: string) {
   switch (providerId) {
     case "openai":
       return "https://api.openai.com/v1/chat/completions";
@@ -275,6 +358,19 @@ function getOpenAICompatibleBaseUrl(providerId: ModelSelection["providerId"]) {
       return "https://api.deepseek.com/chat/completions";
     case "xai":
       return "https://api.x.ai/v1/chat/completions";
+    case "kimi":
+      return "https://api.moonshot.cn/v1/chat/completions";
+    case "qwen":
+      return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+    case "mistral":
+      return "https://api.mistral.ai/v1/chat/completions";
+    case "zhipu":
+      return "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+    case "custom": {
+      const url = customEndpointBaseUrl?.trim();
+      if (!url) throw new GpsError("Custom endpoint URL is not configured in Settings.", 400);
+      return url;
+    }
     default:
       throw new GpsError(`Provider ${providerId} is not OpenAI-compatible.`, 500);
   }
@@ -353,9 +449,10 @@ async function sendOpenAICompatibleMessage(
   apiKey: string,
   messages: ChatMessage[],
   proxyUrl?: string,
+  customEndpointBaseUrl?: string,
 ) {
   try {
-    const response = await proxyFetch(getOpenAICompatibleBaseUrl(model.providerId), {
+    const response = await proxyFetch(getOpenAICompatibleBaseUrl(model.providerId, customEndpointBaseUrl), {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -555,6 +652,7 @@ async function sendModelMessage(
   messages: ChatMessage[],
   ollamaBaseUrl?: string,
   proxyUrl?: string,
+  customEndpointBaseUrl?: string,
 ) {
   const provider = getProvider(model.providerId);
 
@@ -564,7 +662,7 @@ async function sendModelMessage(
 
   switch (provider.requestShape) {
     case "openai-compatible":
-      return sendOpenAICompatibleMessage(model, apiKey || "", messages, proxyUrl);
+      return sendOpenAICompatibleMessage(model, apiKey || "", messages, proxyUrl, customEndpointBaseUrl);
     case "anthropic":
       return sendAnthropicMessage(model, apiKey || "", messages, proxyUrl);
     case "gemini":
@@ -586,6 +684,7 @@ async function checkConsensus(
   apiKey: string | null,
   ollamaBaseUrl: string | undefined,
   proxyUrl: string | undefined,
+  customEndpointBaseUrl?: string,
 ): Promise<boolean> {
   const opinionsBlock = opinions
     .map((o) => `[${o.label || o.modelId}]:\n${o.content}`)
@@ -597,6 +696,7 @@ async function checkConsensus(
     [{ role: "user", content: `${GPS_CONSENSUS_CHECK_PROMPT}\n\n${opinionsBlock}` }],
     ollamaBaseUrl,
     proxyUrl,
+    customEndpointBaseUrl,
   );
 
   return result.trim().toUpperCase().startsWith("YES");
@@ -671,6 +771,9 @@ export async function runGpsWorkflow(
 ): Promise<GpsResponsePayload> {
   ensureValidRequest(payload);
 
+  const proxyFor = (model: ModelSelection) =>
+    payload.ollamaBypassProxy && model.providerId === "ollama" ? undefined : payload.proxyUrl;
+
   const cleanMessages = payload.messages
     .filter(
       (message): message is ChatMessage =>
@@ -686,6 +789,10 @@ export async function runGpsWorkflow(
     cleanMessages,
     payload.webSearchConfig,
     payload.proxyUrl,
+    payload.searchQueryModel,
+    payload.apiKeys,
+    payload.ollamaBaseUrl,
+    payload.customEndpointBaseUrl,
   );
 
   const primaryModel = payload.responderModels[0];
@@ -697,7 +804,8 @@ export async function runGpsWorkflow(
       apiKey,
       enrichedMessages,
       payload.ollamaBaseUrl,
-      payload.proxyUrl,
+      proxyFor(primaryModel),
+      payload.customEndpointBaseUrl,
     );
 
     return {
@@ -718,7 +826,8 @@ export async function runGpsWorkflow(
         apiKey,
         opinionMessages,
         payload.ollamaBaseUrl,
-        payload.proxyUrl,
+        proxyFor(model),
+        payload.customEndpointBaseUrl,
       );
 
       return {
@@ -769,6 +878,8 @@ export async function runGpsWorkflow(
       },
     ],
     payload.ollamaBaseUrl,
+    proxyFor(synthesizerModel),
+    payload.customEndpointBaseUrl,
   );
 
   return {
@@ -793,6 +904,9 @@ export async function* runGpsWorkflowStreaming(
   payload: GpsExecutionPayload,
 ): AsyncGenerator<GpsStreamEvent, void, unknown> {
   ensureValidRequest(payload);
+
+  const proxyFor = (model: ModelSelection) =>
+    payload.ollamaBypassProxy && model.providerId === "ollama" ? undefined : payload.proxyUrl;
 
   const cleanMessages = payload.messages
     .filter(
@@ -823,17 +937,27 @@ export async function* runGpsWorkflowStreaming(
     : cleanMessages;
 
   if (payload.webSearchConfig?.enabled && payload.webSearchConfig.apiKey?.trim()) {
-    yield { type: 'progress', message: 'Searching the web...' };
+    yield { type: 'progress', message: payload.searchQueryModel
+      ? `Generating search queries with ${payload.searchQueryModel.label || payload.searchQueryModel.modelId}...`
+      : 'Searching the web...' };
   }
 
-  const { messages: enrichedMessages, searched, results: webResults } = await maybeInjectWebSearch(
+  const { messages: enrichedMessages, searched, results: webResults, queries: searchQueries } = await maybeInjectWebSearch(
     contextMessages,
     payload.webSearchConfig,
     payload.proxyUrl,
+    payload.searchQueryModel,
+    payload.apiKeys,
+    payload.ollamaBaseUrl,
+    payload.customEndpointBaseUrl,
   );
 
   if (searched) {
-    yield { type: 'progress', message: 'Web search results injected.' };
+    if (searchQueries.length > 1) {
+      yield { type: 'progress', message: `Searched ${searchQueries.length} queries, ${webResults.length} results injected.` };
+    } else {
+      yield { type: 'progress', message: 'Web search results injected.' };
+    }
     yield { type: 'webSearchResults', results: webResults };
   }
 
@@ -852,7 +976,8 @@ export async function* runGpsWorkflowStreaming(
         apiKey,
         enrichedMessages,
         payload.ollamaBaseUrl,
-        payload.proxyUrl,
+        proxyFor(primaryModel),
+        payload.customEndpointBaseUrl,
       );
     } catch (singleModelError) {
       const normalized = normalizeProviderError(singleModelError);
@@ -890,7 +1015,8 @@ export async function* runGpsWorkflowStreaming(
         apiKey,
         opinionMessages,
         payload.ollamaBaseUrl,
-        payload.proxyUrl,
+        proxyFor(model),
+        payload.customEndpointBaseUrl,
       );
       return { ...model, content } satisfies ModelOpinion;
     }),
@@ -944,7 +1070,8 @@ export async function* runGpsWorkflowStreaming(
           synthesizerModel,
           synthApiKey,
           payload.ollamaBaseUrl,
-          payload.proxyUrl,
+          proxyFor(synthesizerModel),
+          payload.customEndpointBaseUrl,
         );
       } catch {
         // If the check itself fails, conservatively assume no consensus
@@ -966,6 +1093,10 @@ export async function* runGpsWorkflowStreaming(
             contextMessages,
             payload.webSearchConfig,
             payload.proxyUrl,
+            payload.searchQueryModel,
+            payload.apiKeys,
+            payload.ollamaBaseUrl,
+            payload.customEndpointBaseUrl,
           );
           if (refreshedResults.length > 0) {
             currentEnrichedMessages = refreshedMessages;
@@ -999,7 +1130,8 @@ export async function* runGpsWorkflowStreaming(
             apiKey,
             debateMessages,
             payload.ollamaBaseUrl,
-            payload.proxyUrl,
+            proxyFor(model),
+            payload.customEndpointBaseUrl,
           );
           return { ...model, content } satisfies ModelOpinion;
         })
@@ -1038,16 +1170,18 @@ export async function* runGpsWorkflowStreaming(
   let compressedContextResult: string | null = null;
 
   if (payload.compressionConfig?.enabled && finalOpinions.length > 0) {
-    yield { type: 'progress', message: 'Compressing debate context...' };
+    const compressionModel = payload.compressionModel ?? synthesizerModel;
+    yield { type: 'progress', message: `Compressing debate context with ${compressionModel.label || compressionModel.modelId}...` };
     try {
       const compressionPrompt = buildCompressionMessage(contextMessages, finalOpinions);
-      const synthApiKey = getRequiredProviderSecret(synthesizerModel, payload.apiKeys);
+      const compressionApiKey = getRequiredProviderSecret(compressionModel, payload.apiKeys);
       compressedContextResult = await sendModelMessage(
-        synthesizerModel,
-        synthApiKey,
+        compressionModel,
+        compressionApiKey,
         [{ role: "user", content: compressionPrompt }],
         payload.ollamaBaseUrl,
-        payload.proxyUrl,
+        proxyFor(compressionModel),
+        payload.customEndpointBaseUrl,
       );
       const originalEstimate = estimateTokens(
         finalOpinions.map((o) => o.content).join(" ") +
@@ -1090,7 +1224,8 @@ export async function* runGpsWorkflowStreaming(
         },
       ],
       payload.ollamaBaseUrl,
-      payload.proxyUrl,
+      proxyFor(synthesizerModel),
+      payload.customEndpointBaseUrl,
     );
   } catch (synthError) {
     const normalized = normalizeProviderError(synthError);
@@ -1121,7 +1256,9 @@ export type SynthesisRetryPayload = {
 
 export type SynthesisRetryExecutionPayload = SynthesisRetryPayload & {
   apiKeys: ApiKeyMap;
+  customEndpointBaseUrl?: string;
   ollamaBaseUrl?: string;
+  ollamaBypassProxy?: boolean;
   proxyUrl?: string;
 };
 
@@ -1137,11 +1274,16 @@ export async function runSynthesisOnly(
     )
     .map((m) => ({ role: m.role, content: m.content.trim() }));
 
+  const synthProxy = payload.ollamaBypassProxy && payload.synthesizerModel.providerId === "ollama"
+    ? undefined
+    : payload.proxyUrl;
+
   return sendModelMessage(
     payload.synthesizerModel,
     apiKey,
     [{ role: "user", content: buildSynthesisMessage(cleanMessages, payload.opinions) }],
     payload.ollamaBaseUrl,
-    payload.proxyUrl,
+    synthProxy,
+    payload.customEndpointBaseUrl,
   );
 }

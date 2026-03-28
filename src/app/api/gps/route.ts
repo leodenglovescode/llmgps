@@ -18,7 +18,9 @@ export async function POST(request: NextRequest) {
     const executionPayload = {
       ...payload,
       apiKeys: executionSettings.apiKeys,
+      customEndpointBaseUrl: executionSettings.customEndpointBaseUrl,
       ollamaBaseUrl: executionSettings.ollamaBaseUrl,
+      ollamaBypassProxy: executionSettings.ollamaBypassProxy,
       proxyUrl: executionSettings.proxyUrl,
       webSearchConfig: executionSettings.webSearchConfig
         ? { ...executionSettings.webSearchConfig, enabled: payload.webSearchEnabled ?? executionSettings.webSearchConfig.enabled }

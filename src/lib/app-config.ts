@@ -3,6 +3,7 @@ import {
   type ProviderId,
   serializeModelSelection,
 } from "@/lib/llm";
+import type { Language } from "@/lib/locales";
 
 export type ProxyConfig = {
   enabled: boolean;
@@ -25,11 +26,13 @@ export const defaultProxyConfig: ProxyConfig = {
 export type OllamaConfig = {
   enabled: boolean;
   baseUrl: string;
+  bypassProxy: boolean;
 };
 
 export const defaultOllamaConfig: OllamaConfig = {
   enabled: false,
   baseUrl: "http://127.0.0.1:11434",
+  bypassProxy: false,
 };
 
 export type WebSearchConfig = {
@@ -45,6 +48,21 @@ export const defaultWebSearchConfig: WebSearchConfig = {
   apiKey: "",
   maxResults: 5,
 };
+
+export type CustomEndpointConfig = {
+  baseUrl: string;
+};
+
+export const defaultCustomEndpointConfig: CustomEndpointConfig = {
+  baseUrl: "",
+};
+
+export function sanitizeCustomEndpointConfig(input?: Partial<CustomEndpointConfig> | null): CustomEndpointConfig {
+  if (!input) return { ...defaultCustomEndpointConfig };
+  return {
+    baseUrl: typeof input.baseUrl === "string" ? input.baseUrl.trim() : "",
+  };
+}
 
 export type CompressionConfig = {
   enabled: boolean;
@@ -89,24 +107,30 @@ export function sanitizeCompressionConfig(
 
 export type RoutingPreferencesPayload = {
   compressionConfig: CompressionConfig;
+  compressionModel: ModelSelection | null;
   customModels: ModelSelection[];
   debateMode: boolean;
   responderModels: ModelSelection[];
+  searchQueryModel: ModelSelection | null;
   synthesizerModel: ModelSelection | null;
 };
 
 export const defaultRoutingPreferences: RoutingPreferencesPayload = {
   compressionConfig: { ...defaultCompressionConfig },
+  compressionModel: null,
   customModels: [],
   debateMode: false,
   responderModels: [],
+  searchQueryModel: null,
   synthesizerModel: null,
 };
 
 export type AppStatusPayload = {
   authenticated: boolean;
   configuredProviders: ProviderId[];
+  customEndpointConfig: CustomEndpointConfig;
   initialized: boolean;
+  language: Language;
   ollamaConfig: OllamaConfig;
   proxyConfig: ProxyConfig;
   routingPreferences: RoutingPreferencesPayload;
@@ -114,6 +138,13 @@ export type AppStatusPayload = {
   username: string | null;
   webSearchConfig: WebSearchConfig;
 };
+
+export function sanitizeLanguage(input: unknown): Language {
+  if (input === "en" || input === "zh") return input;
+  return "auto";
+}
+
+export { type Language };
 
 function sanitizeModelSelection(input: unknown): ModelSelection | null {
   if (!input || typeof input !== "object") {
@@ -129,7 +160,12 @@ function sanitizeModelSelection(input: unknown): ModelSelection | null {
     providerId !== "gemini" &&
     providerId !== "openrouter" &&
     providerId !== "deepseek" &&
+    providerId !== "kimi" &&
+    providerId !== "qwen" &&
+    providerId !== "mistral" &&
+    providerId !== "zhipu" &&
     providerId !== "xai" &&
+    providerId !== "custom" &&
     providerId !== "ollama"
   ) {
     return null;
@@ -185,18 +221,22 @@ export function sanitizeRoutingPreferences(
   if (!input) {
     return {
       compressionConfig: { ...defaultCompressionConfig },
+      compressionModel: null,
       customModels: [],
       debateMode: false,
       responderModels: [],
+      searchQueryModel: null,
       synthesizerModel: null,
     };
   }
 
   return {
     compressionConfig: sanitizeCompressionConfig(input.compressionConfig),
+    compressionModel: sanitizeModelSelection(input.compressionModel),
     customModels: sanitizeModelSelectionList(input.customModels),
     debateMode: Boolean(input.debateMode),
     responderModels: sanitizeModelSelectionList(input.responderModels, 5),
+    searchQueryModel: sanitizeModelSelection(input.searchQueryModel),
     synthesizerModel: sanitizeModelSelection(input.synthesizerModel),
   };
 }
@@ -233,6 +273,7 @@ export function sanitizeOllamaConfig(input?: Partial<OllamaConfig> | null): Olla
   return {
     enabled: Boolean(input.enabled),
     baseUrl: baseUrl || defaultOllamaConfig.baseUrl,
+    bypassProxy: Boolean(input.bypassProxy),
   };
 }
 
