@@ -99,7 +99,7 @@ llmgps 使用加密的 SQLite 数据库存储敏感信息。
 
 ## 辩论模式逻辑流程图
 
-<img width="507" height="2048" alt="debate-logic-flow" src="https://github.com/user-attachments/assets/f81e6156-a090-4a8d-aa4a-929d1bf8cf9a" />
+<img width="507" height="2048" alt="debate-logic-flow" src="https://github.com/user-attachments/assets/810ffe7c-21ce-483a-904a-acc30aaebd84" />
 
 ---
 
