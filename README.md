@@ -84,7 +84,7 @@ llmgps uses an encrypted SQLite database for all sensitive information.
 
 ## Debate Mode Flow Chart
 
-<img width="2029" height="8192" alt="debate-logic-flow" src="https://github.com/user-attachments/assets/f81e6156-a090-4a8d-aa4a-929d1bf8cf9a" />
+<img width="507" height="2048" alt="debate-logic-flow" src="https://github.com/user-attachments/assets/f81e6156-a090-4a8d-aa4a-929d1bf8cf9a" />
 
 ---
 
