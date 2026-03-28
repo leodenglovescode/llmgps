@@ -1127,12 +1127,30 @@ export function LlmgpsShell() {
 
     const payloadMessages: ChatMessage[] = isRollingActive
       ? [{ role: "user", content: userPrompt }]
-      : nextMessages
-          .filter((message) => !message.isOpinion)
-          .map((message) => ({
-            content: message.content,
-            role: message.role,
-          }));
+      : (gpsMode || debateMode)
+        ? (() => {
+            // In GPS/debate mode only carry the last synthesis as context to prevent
+            // context window overflow from accumulating multiple long multi-model outputs.
+            const nonOpinion = messages.filter((m) => !m.isOpinion);
+            const result: ChatMessage[] = [];
+            for (let i = nonOpinion.length - 1; i >= 0; i--) {
+              if (nonOpinion[i].role === "assistant") {
+                if (i > 0 && nonOpinion[i - 1].role === "user") {
+                  result.unshift({ role: "user", content: nonOpinion[i - 1].content });
+                }
+                result.push({ role: "assistant", content: nonOpinion[i].content });
+                break;
+              }
+            }
+            result.push({ role: "user", content: userPrompt });
+            return result;
+          })()
+        : nextMessages
+            .filter((message) => !message.isOpinion)
+            .map((message) => ({
+              content: message.content,
+              role: message.role,
+            }));
 
     setMessages(nextMessages);
     setDraft("");
